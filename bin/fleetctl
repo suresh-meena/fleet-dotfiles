@@ -609,6 +609,96 @@ class FleetContext:
         )
 
 
+# ---- SECTION: resolution (config + args -> Plan, no remote I/O) ------------
+
+
+@dataclass(frozen=True)
+class Plan:
+    """Everything one verb needs to know about one host, resolved once.
+
+    Every host-touching verb used to walk this chain itself, in its own order,
+    with its own omissions: `sync` never resolved a profile, `ssh` never resolved
+    a remote cwd, and `job status` walked the whole chain twice -- once in the
+    handler and again inside run_job_command -- so one command could resolve two
+    different machines.  There is now one value, built once, which is also what
+    makes `--dry-run` honest: it prints the plan the verb is about to use rather
+    than a second guess at it.
+    """
+
+    verb: str
+    context: FleetContext
+    target: TargetRecord
+    binding: ProjectBinding | None
+    protocol: ProtocolRecord
+    profile: ProfileRecord
+    cwd: str | None
+    selector: str | None
+    pool: PoolRecord | None
+    admin: bool
+    _secret: FleetSecret | None = field(default=None, compare=False, repr=False)
+
+    @property
+    def secret(self) -> FleetSecret:
+        """TARGET's connection details, loaded on first use.
+
+        Resolution stays out of the secret store so that `explain` and
+        `--dry-run` can describe a `pass`-backed target without unlocking a gpg
+        agent; only code that actually opens a connection pays for it.
+        """
+        if self._secret is None:
+            object.__setattr__(
+                self, "_secret", self.context.resolve_secret(self.target)
+            )
+        return self._secret
+
+    def ssh_runtime(self) -> dict[str, Any]:
+        """Return the fleet-managed SSH settings for this plan."""
+        return ssh_runtime_kwargs(self.context)
+
+    def describe(self) -> dict[str, Any]:
+        """Report the plan as data, for `--dry-run`, `explain` and `--json`."""
+        return {
+            "verb": self.verb,
+            "selector": self.selector,
+            "pool": self.pool.name if self.pool is not None else None,
+            "target": self.target.name,
+            "role": self.target.role,
+            "protocol": self.protocol.name,
+            "protocol_kind": self.protocol.kind,
+            "profile": self.profile.name,
+            "submits": bool(self.profile.submit_command),
+            "remote_cwd": self.cwd,
+            "admin": self.admin,
+            "project": str(self.binding.path) if self.binding is not None else None,
+        }
+
+
+def build_plan(context: FleetContext, args: argparse.Namespace, verb: str) -> Plan:
+    """Resolve VERB against ARGS once, admission included, before anything runs.
+
+    The role matrix is consulted here rather than in each handler, so a new verb
+    cannot forget it: there is no way to obtain a Plan without passing admission
+    first, and no way to act on a host without a Plan.
+    """
+    selector = context.normalize_selector(getattr(args, "selector", None))
+    target, binding = context.resolve_target(selector, cwd=Path.cwd())
+    protocol = context.resolve_protocol(target)
+    admin = bool(getattr(args, "admin", False))
+    authorize(verb, target, protocol, admin=admin)
+    return Plan(
+        verb=verb,
+        context=context,
+        target=target,
+        binding=binding,
+        protocol=protocol,
+        profile=context.resolve_profile(target, binding, getattr(args, "profile", None)),
+        cwd=resolve_remote_root(target, binding, getattr(args, "cwd", None)),
+        selector=selector,
+        pool=context.pools.get(selector) if selector else None,
+        admin=admin,
+    )
+
+
 def build_paths(
     *,
     config_home: Path | None = None,
@@ -2140,6 +2230,23 @@ def remote_posix_join(base: str, name: str) -> str:
     return posixpath.join(base, name)
 
 
+def resolve_remote_path(value: str, *, base: str | None) -> str:
+    """Resolve one operator-supplied remote path against BASE.
+
+    Absolute stays absolute, `~/...` stays home-relative, and anything else
+    hangs off the target's remote root.  The call sites used to disagree: `sync`
+    read a relative remote path as remote-$HOME-relative while job output paths
+    read the same spelling as project-relative, so `--remote-path logs` and
+    `--output logs/run.out` named two different directories on one host in one
+    command.
+    """
+    if value.startswith("/") or value == "~" or value.startswith("~/"):
+        return value
+    if base is None:
+        return value
+    return remote_posix_join(base, value)
+
+
 def scp_remote_path(path: str) -> str:
     """Normalize a remote path for scp/sftp transports."""
     if path.startswith("~/"):
@@ -2282,21 +2389,14 @@ def resolve_job_output_paths(
         return None, None, None
     output_dir: str | None = None
     if base_root is not None:
-        if protocol.job_output_dir.startswith("/"):
-            output_dir = protocol.job_output_dir
-        else:
-            output_dir = remote_posix_join(base_root, protocol.job_output_dir)
+        output_dir = resolve_remote_path(protocol.job_output_dir, base=base_root)
 
     def resolve_one(value: str | None, fallback_name: str) -> str | None:
         if value is None:
             if output_dir is None:
                 return None
             return remote_posix_join(output_dir, fallback_name)
-        if value.startswith("/"):
-            return value
-        if base_root is None:
-            return value
-        return remote_posix_join(base_root, value)
+        return resolve_remote_path(value, base=base_root)
 
     output_path = resolve_one(output_override, "%j.out")
     error_path = resolve_one(error_override, "%j.err")
@@ -2916,15 +3016,10 @@ def update_project_binding(
     write_text_file(path, serialize_projects(filtered), mode=PRIVATE_FILE_MODE)
 
 
-def command_project_bind(args: argparse.Namespace) -> int:
+def command_project_bind(args: argparse.Namespace, context: FleetContext) -> int:
     """Bind one project path to a default target or pool."""
     if bool(args.target) == bool(args.pool):
         raise FleetError("pass exactly one of --target or --pool")
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     ensure_private_dir(context.paths.config_home, mode=PRIVATE_DIR_MODE)
     write_text_if_missing(
         context.paths.projects_file,
@@ -2975,13 +3070,8 @@ def command_project_bind(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_project_show(args: argparse.Namespace) -> int:
+def command_project_show(args: argparse.Namespace, context: FleetContext) -> int:
     """Show the effective project binding for one path."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     project_path = expand_local_path(args.path or str(Path.cwd()))
     binding = context.project_binding_for(project_path)
     if binding is None:
@@ -2999,13 +3089,8 @@ def command_project_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_project_list(args: argparse.Namespace) -> int:
+def command_project_list(args: argparse.Namespace, context: FleetContext) -> int:
     """List all configured project bindings."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     rows = [
         {
             "path": str(binding.path),
@@ -3038,12 +3123,11 @@ def command_project_list(args: argparse.Namespace) -> int:
 
 def command_init(args: argparse.Namespace) -> int:
     """Create the local private fleet directory layout."""
-    context = FleetContext.load(
+    paths = build_paths(
         config_home=args.config_home,
         state_home=args.state_home,
         cache_home=args.cache_home,
     )
-    paths = context.paths
     ensure_private_dir(paths.config_home, mode=PRIVATE_DIR_MODE)
     ensure_private_dir(paths.targets_dir, mode=PRIVATE_DIR_MODE)
     ensure_private_dir(paths.pools_dir, mode=PRIVATE_DIR_MODE)
@@ -3088,13 +3172,8 @@ def command_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_list(args: argparse.Namespace) -> int:
+def command_list(args: argparse.Namespace, context: FleetContext) -> int:
     """List configured targets."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     if args.format == "ssh-hosts":
         for target in sorted(context.targets.values(), key=lambda item: item.name):
             if not target.enabled:
@@ -3143,13 +3222,8 @@ def command_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_show(args: argparse.Namespace) -> int:
+def command_show(args: argparse.Namespace, context: FleetContext) -> int:
     """Show one target or pool with optional secret preview."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     selector = context.normalize_selector(args.selector)
     payload: dict[str, Any]
 
@@ -3197,13 +3271,8 @@ def command_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_protocol_show(args: argparse.Namespace) -> int:
+def command_protocol_show(args: argparse.Namespace, context: FleetContext) -> int:
     """Show the resolved protocol for one target, pool, or protocol name."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     selector = context.normalize_selector(args.selector)
     payload: dict[str, Any]
     if selector in context.protocols:
@@ -3220,13 +3289,8 @@ def command_protocol_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_queue_list(args: argparse.Namespace) -> int:
+def command_queue_list(args: argparse.Namespace, context: FleetContext) -> int:
     """List the queue presets for one target, pool, or protocol."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     selector = context.normalize_selector(args.selector)
     if selector in context.protocols:
         protocol = context.protocols[selector]
@@ -3256,13 +3320,8 @@ def command_queue_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_resolve(args: argparse.Namespace) -> int:
+def command_resolve(args: argparse.Namespace, context: FleetContext) -> int:
     """Resolve one pool or project binding to a concrete target name."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     target, _binding = context.resolve_target(args.selector, cwd=Path.cwd())
     if args.json:
         print(json.dumps({"target": target.name}, indent=2))
@@ -3271,13 +3330,8 @@ def command_resolve(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_import_ssh(args: argparse.Namespace) -> int:
+def command_import_ssh(args: argparse.Namespace, context: FleetContext) -> int:
     """Import one existing local SSH alias into private fleet config."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     ensure_private_dir(context.paths.config_home, mode=PRIVATE_DIR_MODE)
     ensure_private_dir(context.paths.targets_dir, mode=PRIVATE_DIR_MODE)
     ensure_private_dir(context.paths.secrets_dir, mode=PRIVATE_DIR_MODE)
@@ -3323,13 +3377,8 @@ def command_import_ssh(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_migrate_env(args: argparse.Namespace) -> int:
+def command_migrate_env(args: argparse.Namespace, context: FleetContext) -> int:
     """Import env-based remote config into private fleet state."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     ensure_private_dir(context.paths.config_home, mode=PRIVATE_DIR_MODE)
     ensure_private_dir(context.paths.targets_dir, mode=PRIVATE_DIR_MODE)
     ensure_private_dir(context.paths.secrets_dir, mode=PRIVATE_DIR_MODE)
@@ -3433,13 +3482,8 @@ def required_env_field(env: dict[str, str], prefix: str, machine: str, field: st
     return value
 
 
-def command_seed_pass(args: argparse.Namespace) -> int:
+def command_seed_pass(args: argparse.Namespace, context: FleetContext) -> int:
     """Seed pass entries from the current live fleet config."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     prefix = args.pass_prefix.strip("/")
     if not prefix:
         raise FleetError("`--pass-prefix` must not be empty")
@@ -4001,40 +4045,26 @@ def command_deploy_config(args: argparse.Namespace) -> int:
         print(live.config_home)
     return 0
 
-def command_ssh(args: argparse.Namespace) -> int:
+def command_ssh(args: argparse.Namespace, context: FleetContext) -> int:
     """Open one interactive SSH session."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
-    target, _binding = context.resolve_target(args.selector, cwd=Path.cwd())
-    authorize("ssh", target, context.resolve_protocol(target), admin=bool(args.admin))
-    secret = context.resolve_secret(target)
+    plan = build_plan(context, args, "ssh")
     completed = run_ssh_command(
-        secret,
+        plan.secret,
         allocate_tty=True,
         remote_command=None,
-        **ssh_runtime_kwargs(context),
+        **plan.ssh_runtime(),
     )
     return completed.returncode
 
 
-def command_smoke(args: argparse.Namespace) -> int:
+def command_smoke(args: argparse.Namespace, context: FleetContext) -> int:
     """Run a lightweight connectivity check."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
-    target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
-    protocol = context.resolve_protocol(target)
     # `smoke` only reports on the host, so it rides the same rule as `ssh`.
-    authorize("ssh", target, protocol, admin=bool(args.admin))
-    secret = context.resolve_secret(target)
-    profile = context.resolve_profile(target, binding, args.profile)
+    plan = build_plan(context, args, "ssh")
+    target = plan.target
+    protocol = plan.protocol
     workdir = target.workdir
-    project_root = resolve_remote_root(target, binding, args.cwd)
+    project_root = plan.cwd
     prelude = ""
     if workdir:
         quoted_workdir = shlex.quote(workdir)
@@ -4104,12 +4134,12 @@ def command_smoke(args: argparse.Namespace) -> int:
         smoke_body,
     ]
     completed = run_ssh_command(
-        secret,
+        plan.secret,
         allocate_tty=False,
         remote_command=remote_shell_command(smoke_argv),
         capture_output=True,
         timeout=CONTROL_COMMAND_TIMEOUT,
-        **ssh_runtime_kwargs(context),
+        **plan.ssh_runtime(),
     )
     if completed.stdout:
         print(completed.stdout, end="")
@@ -4123,13 +4153,8 @@ def command_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_exec(args: argparse.Namespace) -> int:
+def command_exec(args: argparse.Namespace, context: FleetContext) -> int:
     """Run one argv vector remotely without shell interpretation of the user payload."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
     # The positional is always a selector and the command always follows `--`.
     # Guessing between the two meant `fleetctl exec htop` silently ran htop on
     # whatever the current directory happened to be bound to.
@@ -4139,19 +4164,14 @@ def command_exec(args: argparse.Namespace) -> int:
             f"two targets named: {args.selector!r} positionally and "
             f"{args.selector_override!r} via --target; the command goes after `--`"
         )
-    selector = args.selector_override or args.selector
+    args.selector = args.selector_override or args.selector
     if not argv:
         raise FleetError(
             "`fleetctl exec` requires a command after `--`, as in "
             "`fleetctl exec rtx1 -- nvidia-smi`"
         )
-    target, binding = context.resolve_target(selector, cwd=Path.cwd())
-    protocol = context.resolve_protocol(target)
-    authorize("exec", target, protocol, admin=bool(args.admin))
-    secret = context.resolve_secret(target)
-    profile = context.resolve_profile(target, binding, args.profile)
-    cwd = resolve_remote_root(target, binding, args.cwd)
-    environment = dict(profile.environment)
+    plan = build_plan(context, args, "exec")
+    environment = dict(plan.profile.environment)
     encoded_stub = base64.b64encode(EXEC_REMOTE_STUB.encode("utf-8")).decode("ascii")
     payload = base64.b64encode(
         json.dumps(
@@ -4163,68 +4183,75 @@ def command_exec(args: argparse.Namespace) -> int:
     ).decode("ascii")
     remote = remote_shell_command(
         ["python3", "-c", EXEC_REMOTE_BOOTSTRAP, encoded_stub, payload],
-        cwd=cwd,
+        cwd=plan.cwd,
     )
     completed = run_ssh_command(
-        secret,
+        plan.secret,
         allocate_tty=bool(args.tty),
         remote_command=remote,
-        **ssh_runtime_kwargs(context),
+        **plan.ssh_runtime(),
     )
     return completed.returncode
 
 
-def command_script(args: argparse.Namespace) -> int:
-    """Upload and run one local script on a target."""
-    local_script = Path(args.local_script).expanduser().resolve()
-    if not local_script.is_file():
-        raise FleetError(f"missing local script: {local_script}")
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
-    target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
-    protocol = context.resolve_protocol(target)
-    authorize("script", target, protocol, admin=bool(args.admin))
-    secret = context.resolve_secret(target)
-    profile = context.resolve_profile(target, binding, args.profile)
-    ssh_runtime = ssh_runtime_kwargs(context)
+def run_script_plan(
+    plan: Plan,
+    local_script: Path,
+    *,
+    interpreter: str | None,
+    script_args: list[str],
+    tty: bool,
+) -> int:
+    """Stage LOCAL_SCRIPT on PLAN's target and run it there."""
+    secret = plan.secret
+    ssh_runtime = plan.ssh_runtime()
     remote_script = stage_remote_script(
         secret,
-        profile,
+        plan.profile,
         local_script,
         ssh_runtime=ssh_runtime,
     )
-    cwd = resolve_remote_root(target, binding, args.cwd)
-    interpreter = args.interpreter or profile.interpreter
-    argv = []
-    if interpreter:
-        argv.extend(shlex.split(interpreter))
+    argv: list[str] = []
+    chosen = interpreter or plan.profile.interpreter
+    if chosen:
+        argv.extend(shlex.split(chosen))
     argv.append(remote_script)
-    argv.extend(args.script_args)
-    argv = prefixed_env_command(argv, profile.environment)
+    argv.extend(script_args)
+    argv = prefixed_env_command(argv, plan.profile.environment)
     completed = run_ssh_command(
         secret,
-        allocate_tty=bool(args.tty),
-        remote_command=remote_shell_command(argv, cwd=cwd),
+        allocate_tty=tty,
+        remote_command=remote_shell_command(argv, cwd=plan.cwd),
         **ssh_runtime,
     )
     return completed.returncode
 
 
-def command_sync(args: argparse.Namespace) -> int:
-    """Push or pull files with rsync."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
+def command_script(args: argparse.Namespace, context: FleetContext) -> int:
+    """Upload and run one local script on a target."""
+    local_script = Path(args.local_script).expanduser().resolve()
+    if not local_script.is_file():
+        raise FleetError(f"missing local script: {local_script}")
+    return run_script_plan(
+        build_plan(context, args, "script"),
+        local_script,
+        interpreter=args.interpreter,
+        script_args=args.script_args,
+        tty=bool(args.tty),
     )
-    target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
-    authorize("sync", target, context.resolve_protocol(target), admin=bool(args.admin))
-    secret = context.resolve_secret(target)
-    ssh_runtime = ssh_runtime_kwargs(context)
-    default_remote = args.remote_path or resolve_remote_root(target, binding)
+
+
+def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
+    """Push or pull files with rsync."""
+    plan = build_plan(context, args, "sync")
+    target = plan.target
+    secret = plan.secret
+    ssh_runtime = plan.ssh_runtime()
+    default_remote = (
+        resolve_remote_path(args.remote_path, base=plan.cwd)
+        if args.remote_path
+        else plan.cwd
+    )
     if not default_remote:
         raise FleetError(
             f"no remote path for {target.name!r}: the target defines no `workdir` and "
@@ -4240,8 +4267,8 @@ def command_sync(args: argparse.Namespace) -> int:
         )
 
     excludes = list(DEFAULT_SYNC_EXCLUDES)
-    if binding is not None:
-        excludes.extend(binding.sync_excludes)
+    if plan.binding is not None:
+        excludes.extend(plan.binding.sync_excludes)
 
     command = ["rsync", "-az"]
     if args.delete:
@@ -4282,23 +4309,18 @@ def command_sync(args: argparse.Namespace) -> int:
     return completed.returncode
 
 
-def command_submit(args: argparse.Namespace) -> int:
+def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
     """Submit or launch a script according to its profile."""
     local_script = Path(args.local_script).expanduser().resolve()
     if not local_script.is_file():
         raise FleetError(f"missing local script: {local_script}")
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
-    target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
-    protocol = context.resolve_protocol(target)
-    authorize("submit", target, protocol, admin=bool(args.admin))
-    secret = context.resolve_secret(target)
-    profile = context.resolve_profile(target, binding, args.profile)
-    ssh_runtime = ssh_runtime_kwargs(context)
-    cwd = resolve_remote_root(target, binding, args.cwd)
+    plan = build_plan(context, args, "submit")
+    target = plan.target
+    protocol = plan.protocol
+    profile = plan.profile
+    secret = plan.secret
+    ssh_runtime = plan.ssh_runtime()
+    cwd = plan.cwd
 
     # Two paths, and the profile itself says which: a profile submits if and only
     # if it defines `submit_command`.  Dispatching on a separate `profile.kind`
@@ -4316,20 +4338,13 @@ def command_submit(args: argparse.Namespace) -> int:
                 f"{target.name!r}; there is no scheduler to allocate resources"
             ),
         )
-        namespace = argparse.Namespace(
-            config_home=args.config_home,
-            state_home=args.state_home,
-            cache_home=args.cache_home,
-            selector=target.name,
-            profile=profile.name,
-            cwd=cwd,
-            local_script=str(local_script),
+        return run_script_plan(
+            plan,
+            local_script,
             interpreter=args.interpreter,
             script_args=args.script_args,
-            admin=bool(args.admin),
             tty=False,
         )
-        return command_script(namespace)
 
     if args.native_batch:
         if args.script_args:
@@ -4371,7 +4386,7 @@ def command_submit(args: argparse.Namespace) -> int:
         local_script,
         ssh_runtime=ssh_runtime,
     )
-    job_base_root = protocol_base_root(target, binding, args.cwd)
+    job_base_root = protocol_base_root(target, plan.binding, args.cwd)
     output_dir, output_path, error_path = resolve_job_output_paths(
         protocol,
         base_root=job_base_root,
@@ -4421,32 +4436,24 @@ def command_submit(args: argparse.Namespace) -> int:
 
 
 def run_job_command(
-    args: argparse.Namespace,
+    plan: Plan,
     template: tuple[str, ...],
+    *,
+    job_id: str,
 ) -> int:
-    """Run one scheduler command from the current profile."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
-    target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
-    authorize("job", target, context.resolve_protocol(target), admin=bool(args.admin))
-    secret = context.resolve_secret(target)
-    profile = context.resolve_profile(target, binding, args.profile)
-    cwd = resolve_remote_root(target, binding, args.cwd)
+    """Run one scheduler command from PLAN's profile."""
     if not template:
         raise FleetError(
-            f"profile {profile.name!r} does not support this job operation"
+            f"profile {plan.profile.name!r} does not support this job operation"
         )
-    argv = render_template_values(template, job_id=args.job_id, workdir=cwd)
+    argv = render_template_values(template, job_id=job_id, workdir=plan.cwd)
     completed = run_ssh_command(
-        secret,
+        plan.secret,
         allocate_tty=False,
-        remote_command=remote_shell_command(argv, cwd=cwd),
+        remote_command=remote_shell_command(argv, cwd=plan.cwd),
         capture_output=True,
         timeout=CONTROL_COMMAND_TIMEOUT,
-        **ssh_runtime_kwargs(context),
+        **plan.ssh_runtime(),
     )
     if completed.stdout:
         print(completed.stdout, end="")
@@ -4455,40 +4462,22 @@ def run_job_command(
     return completed.returncode
 
 
-def command_job_status(args: argparse.Namespace) -> int:
+def command_job_status(args: argparse.Namespace, context: FleetContext) -> int:
     """Check remote scheduler status."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
-    target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
-    profile = context.resolve_profile(target, binding, args.profile)
-    return run_job_command(args, profile.status_command)
+    plan = build_plan(context, args, "job")
+    return run_job_command(plan, plan.profile.status_command, job_id=args.job_id)
 
 
-def command_job_logs(args: argparse.Namespace) -> int:
+def command_job_logs(args: argparse.Namespace, context: FleetContext) -> int:
     """Fetch remote scheduler logs."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
-    target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
-    profile = context.resolve_profile(target, binding, args.profile)
-    return run_job_command(args, profile.logs_command)
+    plan = build_plan(context, args, "job")
+    return run_job_command(plan, plan.profile.logs_command, job_id=args.job_id)
 
 
-def command_job_cancel(args: argparse.Namespace) -> int:
+def command_job_cancel(args: argparse.Namespace, context: FleetContext) -> int:
     """Cancel one remote scheduler job."""
-    context = FleetContext.load(
-        config_home=args.config_home,
-        state_home=args.state_home,
-        cache_home=args.cache_home,
-    )
-    target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
-    profile = context.resolve_profile(target, binding, args.profile)
-    return run_job_command(args, profile.cancel_command)
+    plan = build_plan(context, args, "job")
+    return run_job_command(plan, plan.profile.cancel_command, job_id=args.job_id)
 
 
 def toml_syntax_problems(paths: FleetPaths) -> list[str]:
@@ -4769,7 +4758,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Populate example target, pool, and secret templates",
     )
-    init_parser.set_defaults(handler=command_init)
+    init_parser.set_defaults(handler=command_init, loads_own_config=True)
 
     list_parser = subparsers.add_parser("list", help="List configured targets")
     list_parser.add_argument("--json", action="store_true", help="Emit JSON")
@@ -4925,7 +4914,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print a short post-deploy summary after validation",
     )
-    deploy_config_parser.set_defaults(handler=command_deploy_config)
+    deploy_config_parser.set_defaults(handler=command_deploy_config, loads_own_config=True)
 
     migrate_config_parser = subparsers.add_parser(
         "migrate-config",
@@ -4954,7 +4943,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the migration and validate it, but leave the live config alone",
     )
-    migrate_config_parser.set_defaults(handler=command_migrate_config)
+    migrate_config_parser.set_defaults(handler=command_migrate_config, loads_own_config=True)
 
     import_ssh_parser = subparsers.add_parser(
         "import-ssh",
@@ -5241,7 +5230,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also connect to every enabled target and check remote prerequisites",
     )
-    doctor_parser.set_defaults(handler=command_doctor)
+    doctor_parser.set_defaults(handler=command_doctor, loads_own_config=True)
 
     return parser
 
@@ -5272,7 +5261,18 @@ def main() -> int:
                 setattr(args, attribute, payload)
 
     try:
-        return int(args.handler(args))
+        # One load, one place.  There were twenty-four independent loads, which is
+        # how `job status` came to resolve its target twice in one invocation.
+        # The repair and diagnostic verbs opt out with `loads_own_config`: for
+        # those a broken config is the input, not a precondition.
+        if getattr(args, "loads_own_config", False):
+            return int(args.handler(args))
+        context = FleetContext.load(
+            config_home=args.config_home,
+            state_home=args.state_home,
+            cache_home=args.cache_home,
+        )
+        return int(args.handler(args, context))
     except FleetError as exc:
         parser.exit(exc.exit_code, f"error: {exc}\n")
     except KeyboardInterrupt:
