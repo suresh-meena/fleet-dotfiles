@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import json
 import os
 import posixpath
@@ -272,6 +273,7 @@ class FleetContext:
             cache_home=cache_home,
         )
         config = load_toml_file(paths.config_file, default={})
+        validate_config_file(config, source=paths.config_file)
         targets = load_targets(paths.targets_dir)
         pools = load_pools(paths.pools_dir)
         protocols = load_protocols(paths.protocols_dir)
@@ -419,7 +421,7 @@ class FleetContext:
                 raise FleetError(f"target {target.name!r} is missing `secret_ref`")
             path = expand_local_path(target.secret_ref)
             raw = load_toml_file(path)
-            return parse_secret_dict(raw)
+            return parse_secret_dict(raw, source=path)
         if target.secret_backend == "pass":
             if not target.secret_ref:
                 raise FleetError(f"target {target.name!r} is missing `secret_ref`")
@@ -497,6 +499,247 @@ def load_repo_template(path: str, fallback: str) -> str:
     return template_path.read_text(encoding="utf-8")
 
 
+# ---- SECTION: config schema ------------------------------------------------
+#
+# Every key fleetctl understands is listed here, and anything else in a config
+# file is a hard error.  This is deliberate: silently ignoring an unknown key is
+# the tool's worst failure mode, because the defaults that fill in for a
+# misspelled key are the permissive ones.  `protocal = "amd-slurm"` used to
+# leave the target on the built-in `direct` protocol, which allows unrestricted
+# login-node execution -- a typo quietly turned a scheduler site into a box you
+# could run training jobs on directly.  Failing at load time, naming the file
+# and the key, is worth more than any amount of downstream checking.
+
+CONFIG_VERSION = 1
+
+CONFIG_KEYS = frozenset({"version", "defaults", "ssh"})
+CONFIG_DEFAULTS_KEYS = frozenset({"redact_sensitive_output"})
+CONFIG_SSH_KEYS = frozenset(
+    {
+        "user_known_hosts_file",
+        "strict_host_key_checking",
+        "update_host_keys",
+        "control_path",
+    }
+)
+TARGET_KEYS = frozenset(
+    {
+        "version",
+        "name",
+        "enabled",
+        "transport",
+        "protocol",
+        "workdir",
+        "tags",
+        "secret_backend",
+        "secret_ref",
+        "secret",
+        "ssh_host_alias",
+        "default_profile",
+        "scheduler",
+        "metadata",
+    }
+)
+POOL_KEYS = frozenset(
+    {"version", "name", "targets", "match_tags", "strategy", "default_profile"}
+)
+PROTOCOL_KEYS = frozenset(
+    {
+        "version",
+        "name",
+        "kind",
+        "description",
+        "default_profile",
+        "scheduler_required",
+        "allow_login_exec",
+        "smoke_gpu_probe",
+        "gpu_request_mode",
+        "job_runtime",
+        "native_batch_required",
+        "job_output_dir",
+        "docs",
+        "notes",
+        "queue",
+    }
+)
+QUEUE_KEYS = frozenset(
+    {
+        "name",
+        "partition",
+        "default",
+        "time_limit",
+        "gpus",
+        "gres",
+        "cpus_per_task",
+        "mem",
+        "account",
+        "qos",
+        "constraint",
+        "directive",
+        "directives",
+        "notes",
+    }
+)
+PROFILE_KEYS = frozenset(
+    {
+        "version",
+        "name",
+        "kind",
+        "script",
+        "environment",
+        "submit_command",
+        "status_command",
+        "cancel_command",
+        "logs_command",
+        "job_id_pattern",
+    }
+)
+PROFILE_SCRIPT_KEYS = frozenset({"interpreter", "remote_script_root"})
+PROJECTS_FILE_KEYS = frozenset({"version", "project"})
+PROJECT_KEYS = frozenset(
+    {
+        "path",
+        "default_target",
+        "default_pool",
+        "default_profile",
+        "remote_root",
+        "target_root",
+        "sync_excludes",
+    }
+)
+PROJECT_TARGET_ROOT_KEYS = frozenset({"target", "remote_root"})
+SECRET_KEYS = frozenset(
+    {
+        "host",
+        "user",
+        "port",
+        "auth",
+        "identity_file",
+        "password",
+        "proxy_jump",
+        "identities_only",
+        "forward_agent",
+        "compression",
+        "connect_timeout",
+        "server_alive_interval",
+        "server_alive_count_max",
+        "strict_host_key_checking",
+        "batch_mode",
+        "ssh_option",
+    }
+)
+
+TRANSPORTS = ("ssh",)
+SECRET_BACKENDS = ("file", "pass", "inline")
+SCHEDULERS = ("none", "slurm")
+POOL_STRATEGIES = ("ordered", "random")
+PROTOCOL_KINDS = ("direct", "slurm")
+PROFILE_KINDS = ("direct", "scheduler")
+GPU_REQUEST_MODES = ("none", "gpus", "gres")
+AUTH_MODES = ("key", "password")
+STRICT_HOST_KEY_MODES = ("yes", "no", "off", "ask", "accept-new")
+
+
+def reject_unknown_keys(
+    raw: dict[str, Any],
+    known: Iterable[str],
+    *,
+    what: str,
+    source: Path | None = None,
+    guidance: dict[str, str] | None = None,
+) -> None:
+    """Fail on any key the loader would otherwise ignore."""
+    known_keys = sorted(known)
+    unknown = sorted(key for key in raw if key not in set(known_keys))
+    if not unknown:
+        return
+    hints: list[str] = []
+    for key in unknown:
+        if guidance and key in guidance:
+            hints.append(f"`{key}` ({guidance[key]})")
+            continue
+        close = difflib.get_close_matches(key, known_keys, n=1, cutoff=0.7)
+        suggestion = f" (did you mean `{close[0]}`?)" if close else ""
+        hints.append(f"`{key}`{suggestion}")
+    where = f" in {source}" if source is not None else ""
+    plural = "keys" if len(unknown) > 1 else "key"
+    raise FleetError(
+        f"unrecognised {plural} in {what}{where}: {'; '.join(hints)}. "
+        f"Known keys: {', '.join(known_keys)}."
+    )
+
+
+def check_vocabulary(
+    value: str,
+    allowed: tuple[str, ...],
+    *,
+    what: str,
+    key: str,
+    source: Path | None = None,
+) -> str:
+    """Return VALUE when it is a member of ALLOWED, else fail."""
+    if value in allowed:
+        return value
+    close = difflib.get_close_matches(value, list(allowed), n=1, cutoff=0.6)
+    suggestion = f" Did you mean {close[0]!r}?" if close else ""
+    where = f" in {source}" if source is not None else ""
+    raise FleetError(
+        f"invalid `{key}` for {what}{where}: {value!r} is not one of "
+        f"{', '.join(repr(item) for item in allowed)}.{suggestion}"
+    )
+
+
+def check_version(
+    raw: dict[str, Any],
+    *,
+    what: str,
+    source: Path | None = None,
+) -> None:
+    """Reject a config file written for a different schema generation."""
+    if "version" not in raw:
+        return
+    version = raw["version"]
+    if version != CONFIG_VERSION:
+        where = f" in {source}" if source is not None else ""
+        raise FleetError(
+            f"unsupported `version` for {what}{where}: {version!r}; this "
+            f"fleetctl understands version {CONFIG_VERSION}"
+        )
+
+
+def check_table(value: Any, *, what: str, source: Path | None = None) -> dict[str, Any]:
+    """Return VALUE as a TOML table or fail with a readable message."""
+    if not isinstance(value, dict):
+        where = f" in {source}" if source is not None else ""
+        raise FleetError(f"{what}{where} must be a table, not {type(value).__name__}")
+    return value
+
+
+def validate_config_file(raw: dict[str, Any], *, source: Path) -> None:
+    """Validate the top-level config.toml."""
+    check_version(raw, what="fleet config", source=source)
+    reject_unknown_keys(raw, CONFIG_KEYS, what="fleet config", source=source)
+    defaults = check_table(
+        raw.get("defaults", {}), what="`defaults`", source=source
+    )
+    reject_unknown_keys(
+        defaults, CONFIG_DEFAULTS_KEYS, what="fleet config `[defaults]`", source=source
+    )
+    ssh_section = check_table(raw.get("ssh", {}), what="`ssh`", source=source)
+    reject_unknown_keys(
+        ssh_section, CONFIG_SSH_KEYS, what="fleet config `[ssh]`", source=source
+    )
+    strict = optional_str(ssh_section.get("strict_host_key_checking"))
+    if strict is not None:
+        check_vocabulary(
+            strict,
+            STRICT_HOST_KEY_MODES,
+            what="fleet config `[ssh]`",
+            key="strict_host_key_checking",
+            source=source,
+        )
+
+
 def load_toml_file(path: Path, *, default: Any | None = None) -> dict[str, Any]:
     """Load PATH as TOML or return DEFAULT when missing."""
     if not path.exists():
@@ -536,21 +779,52 @@ TARGET_FILE_WARNINGS: dict[str, str] = {
 def load_targets(path: Path) -> dict[str, TargetRecord]:
     """Load target metadata files."""
     targets: dict[str, TargetRecord] = {}
-    for name, raw, _source in load_records_from_dir(path):
+    for name, raw, source in load_records_from_dir(path):
+        what = f"target {name!r}"
+        check_version(raw, what=what, source=source)
+        reject_unknown_keys(
+            raw,
+            TARGET_KEYS,
+            what=what,
+            source=source,
+            guidance=TARGET_FILE_WARNINGS,
+        )
         target = TargetRecord(
             name=name,
             enabled=bool(raw.get("enabled", True)),
-            transport=str(raw.get("transport", "ssh")),
+            transport=check_vocabulary(
+                str(raw.get("transport", "ssh")),
+                TRANSPORTS,
+                what=what,
+                key="transport",
+                source=source,
+            ),
             protocol=optional_str(raw.get("protocol")),
             workdir=optional_str(raw.get("workdir")),
             tags=tuple(str(item) for item in raw.get("tags", [])),
-            secret_backend=str(raw.get("secret_backend", "file")),
+            secret_backend=check_vocabulary(
+                str(raw.get("secret_backend", "file")),
+                SECRET_BACKENDS,
+                what=what,
+                key="secret_backend",
+                source=source,
+            ),
             secret_ref=optional_str(raw.get("secret_ref")),
-            secret_inline=dict(raw.get("secret", {})),
+            secret_inline=check_table(
+                raw.get("secret", {}), what=f"`secret` for {what}", source=source
+            ),
             ssh_host_alias=optional_str(raw.get("ssh_host_alias")),
             default_profile=optional_str(raw.get("default_profile")),
-            scheduler=str(raw.get("scheduler", "none")),
-            metadata=dict(raw.get("metadata", {})),
+            scheduler=check_vocabulary(
+                str(raw.get("scheduler", "none")),
+                SCHEDULERS,
+                what=what,
+                key="scheduler",
+                source=source,
+            ),
+            metadata=check_table(
+                raw.get("metadata", {}), what=f"`metadata` for {what}", source=source
+            ),
         )
         targets[target.name] = target
     return targets
@@ -559,14 +833,33 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
 def load_pools(path: Path) -> dict[str, PoolRecord]:
     """Load pool metadata files."""
     pools: dict[str, PoolRecord] = {}
-    for name, raw, _source in load_records_from_dir(path):
+    for name, raw, source in load_records_from_dir(path):
+        what = f"pool {name!r}"
+        check_version(raw, what=what, source=source)
+        reject_unknown_keys(raw, POOL_KEYS, what=what, source=source)
         pool = PoolRecord(
             name=name,
             targets=tuple(str(item) for item in raw.get("targets", [])),
             match_tags=tuple(str(item) for item in raw.get("match_tags", [])),
-            strategy=str(raw.get("strategy", "ordered")),
+            strategy=check_vocabulary(
+                str(raw.get("strategy", "ordered")),
+                POOL_STRATEGIES,
+                what=what,
+                key="strategy",
+                source=source,
+            ),
             default_profile=optional_str(raw.get("default_profile")),
         )
+        if not pool.targets and not pool.match_tags:
+            # `select_pool` treats "no members declared" as "every target",
+            # which resolves to the alphabetically first host in the fleet --
+            # today a Slurm controller.  A pool that names nobody is a config
+            # mistake, never a request to match everything.
+            raise FleetError(
+                f"{what} in {source} declares neither `targets` nor "
+                "`match_tags`, so it would match the entire fleet; list its "
+                "members explicitly"
+            )
         pools[pool.name] = pool
     return pools
 
@@ -606,13 +899,19 @@ def built_in_protocols() -> dict[str, ProtocolRecord]:
 def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
     """Load protocol definitions and merge them over the built-ins."""
     protocols = built_in_protocols()
-    for name, raw, _source in load_records_from_dir(path):
+    for name, raw, source in load_records_from_dir(path):
+        what = f"protocol {name!r}"
+        check_version(raw, what=what, source=source)
+        reject_unknown_keys(raw, PROTOCOL_KEYS, what=what, source=source)
         queues: list[QueueRecord] = []
         for item in raw.get("queue", []):
             if not isinstance(item, dict):
                 raise FleetError(
                     f"invalid queue entry in protocol {name!r}; expected a table"
                 )
+            reject_unknown_keys(
+                item, QUEUE_KEYS, what=f"a queue entry in {what}", source=source
+            )
             partition = optional_str(item.get("partition")) or optional_str(
                 item.get("name")
             )
@@ -658,7 +957,13 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
             note_values = (notes,)
         else:
             note_values = tuple(str(value) for value in notes)
-        kind = str(raw.get("kind", "direct"))
+        kind = check_vocabulary(
+            str(raw.get("kind", "direct")),
+            PROTOCOL_KINDS,
+            what=what,
+            key="kind",
+            source=source,
+        )
         protocols[name] = ProtocolRecord(
             name=name,
             kind=kind,
@@ -670,7 +975,13 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
             ),
             allow_login_exec=bool(raw.get("allow_login_exec", kind != "slurm")),
             smoke_gpu_probe=bool(raw.get("smoke_gpu_probe", kind != "slurm")),
-            gpu_request_mode=str(raw.get("gpu_request_mode", "gres")),
+            gpu_request_mode=check_vocabulary(
+                str(raw.get("gpu_request_mode", "gres")),
+                GPU_REQUEST_MODES,
+                what=what,
+                key="gpu_request_mode",
+                source=source,
+            ),
             job_runtime=str(raw.get("job_runtime", "host")),
             native_batch_required=bool(raw.get("native_batch_required", False)),
             job_output_dir=str(raw.get("job_output_dir", ".fleet/jobs")),
@@ -684,13 +995,25 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
 def load_profiles(path: Path) -> dict[str, ProfileRecord]:
     """Load execution profile files."""
     profiles: dict[str, ProfileRecord] = {}
-    for name, raw, _source in load_records_from_dir(path):
+    for name, raw, source in load_records_from_dir(path):
+        what = f"profile {name!r}"
+        check_version(raw, what=what, source=source)
+        reject_unknown_keys(raw, PROFILE_KEYS, what=what, source=source)
         submit = tuple(str(item) for item in raw.get("submit_command", []))
         status = tuple(str(item) for item in raw.get("status_command", []))
         cancel = tuple(str(item) for item in raw.get("cancel_command", []))
         logs = tuple(str(item) for item in raw.get("logs_command", []))
-        script = raw.get("script", {})
-        environment = raw.get("environment", {})
+        script = check_table(
+            raw.get("script", {}), what=f"`[script]` for {what}", source=source
+        )
+        reject_unknown_keys(
+            script, PROFILE_SCRIPT_KEYS, what=f"`[script]` for {what}", source=source
+        )
+        environment = check_table(
+            raw.get("environment", {}),
+            what=f"`[environment]` for {what}",
+            source=source,
+        )
         if isinstance(script, dict):
             interpreter = optional_str(script.get("interpreter"))
             remote_script_root = str(
@@ -701,7 +1024,13 @@ def load_profiles(path: Path) -> dict[str, ProfileRecord]:
             remote_script_root = DEFAULT_SCRIPT_REMOTE_ROOT
         profiles[name] = ProfileRecord(
             name=name,
-            kind=str(raw.get("kind", "direct")),
+            kind=check_vocabulary(
+                str(raw.get("kind", "direct")),
+                PROFILE_KINDS,
+                what=what,
+                key="kind",
+                source=source,
+            ),
             interpreter=interpreter,
             remote_script_root=remote_script_root,
             environment={str(key): str(value) for key, value in environment.items()},
@@ -721,14 +1050,37 @@ def load_projects(path: Path) -> list[ProjectBinding]:
     if not path.exists():
         return []
     raw = load_toml_file(path)
+    check_version(raw, what="project bindings", source=path)
+    reject_unknown_keys(raw, PROJECTS_FILE_KEYS, what="project bindings", source=path)
     bindings: list[ProjectBinding] = []
-    for item in raw.get("project", []):
+    for index, item in enumerate(raw.get("project", [])):
+        item = check_table(item, what=f"`[[project]]` #{index + 1}", source=path)
+        if "path" not in item:
+            raise FleetError(
+                f"`[[project]]` #{index + 1} in {path} has no `path`; a binding "
+                "must name the local project directory it applies to"
+            )
+        what = f"project binding {str(item['path'])!r}"
+        reject_unknown_keys(item, PROJECT_KEYS, what=what, source=path)
         target_roots = {}
         for entry in item.get("target_root", []):
+            entry = check_table(
+                entry, what=f"`[[project.target_root]]` for {what}", source=path
+            )
+            reject_unknown_keys(
+                entry,
+                PROJECT_TARGET_ROOT_KEYS,
+                what=f"`[[project.target_root]]` for {what}",
+                source=path,
+            )
             target_name = optional_str(entry.get("target"))
             remote_root = optional_str(entry.get("remote_root"))
-            if target_name and remote_root:
-                target_roots[target_name] = remote_root
+            if not target_name or not remote_root:
+                raise FleetError(
+                    f"`[[project.target_root]]` for {what} in {path} needs both "
+                    "`target` and `remote_root`"
+                )
+            target_roots[target_name] = remote_root
         bindings.append(
             ProjectBinding(
                 path=expand_local_path(str(item["path"])),
@@ -758,20 +1110,40 @@ def target_schema_warnings(path: Path) -> list[str]:
     return warnings
 
 
-def parse_secret_dict(raw: dict[str, Any]) -> FleetSecret:
+def parse_secret_dict(raw: dict[str, Any], *, source: Path | None = None) -> FleetSecret:
     """Parse one secret record from TOML-style data."""
+    # A typo here is quiet and dangerous in a different way to the other
+    # loaders: `proxyjump` instead of `proxy_jump` drops the bridge hop and
+    # sends the connection straight at a host that is not directly reachable.
+    reject_unknown_keys(raw, SECRET_KEYS, what="secret record", source=source)
     host = optional_str(raw.get("host"))
     user = optional_str(raw.get("user"))
     if not host or not user:
         raise FleetError("secret record must define both `host` and `user`")
     port = int(raw.get("port", 22))
-    auth = str(raw.get("auth", "key"))
+    auth = check_vocabulary(
+        str(raw.get("auth", "key")),
+        AUTH_MODES,
+        what="secret record",
+        key="auth",
+        source=source,
+    )
     identity_file = optional_str(raw.get("identity_file"))
     password = optional_str(raw.get("password"))
     proxy_jump = optional_str(raw.get("proxy_jump"))
     strict_host_key_checking = optional_str(raw.get("strict_host_key_checking"))
+    if strict_host_key_checking is not None:
+        check_vocabulary(
+            strict_host_key_checking,
+            STRICT_HOST_KEY_MODES,
+            what="secret record",
+            key="strict_host_key_checking",
+            source=source,
+        )
     batch_mode_raw = raw.get("batch_mode")
-    extra_options_raw = raw.get("ssh_option", {})
+    extra_options_raw = check_table(
+        raw.get("ssh_option", {}), what="`[ssh_option]` in secret record", source=source
+    )
     return FleetSecret(
         host=host,
         user=user,
