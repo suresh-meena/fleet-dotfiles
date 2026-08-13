@@ -224,6 +224,87 @@ class FleetError(RuntimeError):
         self.exit_code = exit_code
 
 
+# ---- SECTION: reachability -------------------------------------------------
+#
+# How a host is reached is inventory, not a credential.  It used to be a
+# `proxy_jump = "user@host"` string inside a secret file, which made the fleet's
+# topology invisible (nothing could answer "what stops working if the bridge
+# dies"), unvalidatable (a typo aimed the connection at a host with no route to
+# it), duplicated across every clustered target, and -- worst -- outside every
+# fleet-managed SSH setting, because OpenSSH resolves a ProxyJump out of
+# ~/.ssh/config with none of the private known_hosts, IdentitiesOnly, timeouts
+# or control sockets fleetctl sets up for the destination.
+#
+# `reach` is an ordered list of routes: direct first, the bridge as the fallback.
+# That ordering is the point.  A tailnet or a VPN makes the direct route work
+# most of the time, and a Raspberry Pi multiplexing every clustered connection is
+# the last thing you want in the path when you do not need it.
+
+ROUTE_DIRECT = "direct"
+ROUTE_VIA_PREFIX = "via:"
+DEFAULT_REACH = (ROUTE_DIRECT,)
+
+
+def route_bridge(route: str) -> str | None:
+    """Return the bridge target ROUTE passes through, or None if it is direct."""
+    if route.startswith(ROUTE_VIA_PREFIX):
+        return route[len(ROUTE_VIA_PREFIX) :]
+    return None
+
+
+def parse_route(value: Any, *, what: str, source: Path | None = None) -> str:
+    """Validate one route's shape.  Whether the bridge exists is a graph question."""
+    where = f" in {source}" if source is not None else ""
+    if not isinstance(value, str):
+        raise FleetError(
+            f"invalid route for {what}{where}: {value!r} is not a string; a route is "
+            f'"{ROUTE_DIRECT}" or "{ROUTE_VIA_PREFIX}<target>"'
+        )
+    route = value.strip()
+    if route == ROUTE_DIRECT:
+        return route
+    bridge = route_bridge(route)
+    if bridge and not any(character.isspace() for character in bridge):
+        return route
+    raise FleetError(
+        f"invalid route for {what}{where}: {value!r}. A route is "
+        f'"{ROUTE_DIRECT}" for a host you dial yourself, or '
+        f'"{ROUTE_VIA_PREFIX}<target>" naming the fleet target that carries the '
+        "connection."
+    )
+
+
+def parse_reach(value: Any, *, what: str, source: Path | None = None) -> tuple[str, ...]:
+    """Parse `reach` into an ordered, duplicate-free route list."""
+    where = f" in {source}" if source is not None else ""
+    raw = [value] if isinstance(value, str) else value
+    if not isinstance(raw, (list, tuple)):
+        raise FleetError(
+            f"`reach` for {what}{where} must be a route or a list of routes, not "
+            f"{type(value).__name__}"
+        )
+    ordered: list[str] = []
+    for item in raw:
+        route = parse_route(item, what=what, source=source)
+        if route in ordered:
+            raise FleetError(
+                f"`reach` for {what}{where} lists {route!r} twice; each route is "
+                "tried once, in the order written"
+            )
+        ordered.append(route)
+    if not ordered:
+        raise FleetError(
+            f"`reach` for {what}{where} is empty, so nothing could ever reach it. "
+            f'Drop the key to mean ["{ROUTE_DIRECT}"].'
+        )
+    return tuple(ordered)
+
+
+def format_reach(reach: Iterable[str]) -> str:
+    """Render a route list for one message or one table cell."""
+    return ",".join(reach)
+
+
 @dataclass(frozen=True)
 class FleetSecret:
     """Resolved connection details that should stay outside version control."""
@@ -234,7 +315,6 @@ class FleetSecret:
     auth: str = "key"
     identity_file: str | None = None
     password: str | None = None
-    proxy_jump: str | None = None
     identities_only: bool = True
     forward_agent: bool = False
     compression: bool = False
@@ -259,6 +339,7 @@ class TargetRecord:
     transport: str = "ssh"
     role: str | None = None
     protocol: str | None = None
+    reach: tuple[str, ...] = DEFAULT_REACH
     workdir: str | None = None
     tags: tuple[str, ...] = ()
     secret_backend: str = "file"
@@ -432,6 +513,83 @@ class FleetContext:
                 )
         return context
 
+    def reach_problems(self) -> list[str]:
+        """Validate the reachability graph before anything tries to use it.
+
+        A bridge is a declared job, not a side effect of being mentioned: a hop
+        must name a real, enabled target whose role is `bridge`.  That is the
+        same taint rule the verbs use, applied to transport -- carrying other
+        people's connections is something a machine opts into.
+        """
+        problems: list[str] = []
+        cycles: set[tuple[str, ...]] = set()
+        for target in sorted(self.targets.values(), key=lambda item: item.name):
+            for route in target.reach:
+                bridge_name = route_bridge(route)
+                if bridge_name is None:
+                    continue
+                if bridge_name == target.name:
+                    problems.append(
+                        f"target {target.name!r} declares {route!r}: a target "
+                        "cannot be its own bridge"
+                    )
+                    continue
+                bridge = self.targets.get(bridge_name)
+                if bridge is None:
+                    problems.append(
+                        f"target {target.name!r} declares {route!r}, but no target "
+                        f"{bridge_name!r} exists; run `fleetctl list`"
+                    )
+                    continue
+                if not bridge.enabled:
+                    problems.append(
+                        f"target {target.name!r} is reached through {bridge_name!r}, "
+                        "which is disabled -- so nothing can reach it either"
+                    )
+                try:
+                    role = resolve_role(bridge, self.resolve_protocol(bridge))
+                except FleetError as exc:
+                    problems.append(
+                        f"target {target.name!r} is reached through {bridge_name!r}, "
+                        f"whose own config does not resolve: {exc}"
+                    )
+                    continue
+                if role != "bridge":
+                    problems.append(
+                        f"target {target.name!r} is reached through {bridge_name!r}, "
+                        f"which is a {role} node. Carrying other connections is a "
+                        'declared job: set `role = "bridge"` on it, or reach '
+                        f"{target.name!r} another way"
+                    )
+            cycle = self.reach_cycle(target.name)
+            if cycle is not None:
+                cycles.add(tuple(sorted(set(cycle))))
+        for members in sorted(cycles):
+            problems.append(
+                "reach cycle between "
+                + ", ".join(repr(name) for name in members)
+                + ": every route through it would recurse until the process died"
+            )
+        return problems
+
+    def reach_cycle(
+        self, name: str, seen: tuple[str, ...] = ()
+    ) -> tuple[str, ...] | None:
+        """Return the first bridge chain that revisits a target, if one exists."""
+        if name in seen:
+            return (*seen, name)
+        target = self.targets.get(name)
+        if target is None:
+            return None
+        for route in target.reach:
+            bridge_name = route_bridge(route)
+            if bridge_name is None:
+                continue
+            cycle = self.reach_cycle(bridge_name, (*seen, name))
+            if cycle is not None:
+                return cycle
+        return None
+
     def coherence_problems(self) -> list[str]:
         """Return every role/protocol/profile disagreement in the inventory.
 
@@ -446,6 +604,7 @@ class FleetContext:
                 self.resolve_profile(target, None, None)
             except FleetError as exc:
                 problems.append(str(exc))
+        problems.extend(self.reach_problems())
         return problems
 
     def project_binding_for(self, path: Path | None = None) -> ProjectBinding | None:
@@ -596,25 +755,32 @@ class FleetContext:
         check_role_protocol(target, protocol)
         return protocol
 
-    def resolve_secret(self, target: TargetRecord) -> FleetSecret:
-        """Load sensitive connection details for TARGET."""
+    def resolve_secret_raw(
+        self, target: TargetRecord
+    ) -> tuple[dict[str, Any], Path | None]:
+        """Fetch TARGET's secret material as written, and say where it came from.
+
+        Only the migration wants this: it has to read a key the parsed record no
+        longer carries.  Everything else goes through resolve_secret().
+        """
         if target.secret_backend == "inline":
-            return parse_secret_dict(target.secret_inline)
+            return dict(target.secret_inline), None
+        if not target.secret_ref:
+            raise FleetError(f"target {target.name!r} is missing `secret_ref`")
         if target.secret_backend == "file":
-            if not target.secret_ref:
-                raise FleetError(f"target {target.name!r} is missing `secret_ref`")
             path = expand_local_path(target.secret_ref)
-            raw = load_toml_file(path)
-            return parse_secret_dict(raw, source=path)
+            return load_toml_file(path), path
         if target.secret_backend == "pass":
-            if not target.secret_ref:
-                raise FleetError(f"target {target.name!r} is missing `secret_ref`")
-            raw = parse_secret_blob(run_pass_show(target.secret_ref))
-            return parse_secret_dict(raw)
+            return parse_secret_blob(run_pass_show(target.secret_ref)), None
         raise FleetError(
             f"target {target.name!r} uses unsupported secret backend "
             f"{target.secret_backend!r}"
         )
+
+    def resolve_secret(self, target: TargetRecord) -> FleetSecret:
+        """Load sensitive connection details for TARGET."""
+        raw, source = self.resolve_secret_raw(target)
+        return parse_secret_dict(raw, source=source)
 
 
 # ---- SECTION: resolution (config + args -> Plan, no remote I/O) ------------
@@ -643,6 +809,7 @@ class Plan:
     selector: str | None
     pool: PoolRecord | None
     admin: bool
+    routes: tuple[str, ...] = DEFAULT_REACH
     _secret: FleetSecret | None = field(default=None, compare=False, repr=False)
 
     @property
@@ -659,9 +826,19 @@ class Plan:
             )
         return self._secret
 
+    @property
+    def route(self) -> str:
+        """The route this plan uses.
+
+        For a target that declares no bridge this is the only candidate; with a
+        fallback declared it is the one tried first, which is what the argv
+        builders need in order to be printable before any connection exists.
+        """
+        return self.routes[0] if self.routes else ROUTE_DIRECT
+
     def ssh_runtime(self) -> dict[str, Any]:
-        """Return the fleet-managed SSH settings for this plan."""
-        return ssh_runtime_kwargs(self.context)
+        """Return the fleet-managed SSH settings for this plan, hop included."""
+        return ssh_runtime_kwargs(self.context, target=self.target, route=self.route)
 
     def ssh_connect_argv(self) -> list[str]:
         """The ssh invocation this plan will use, without the remote command."""
@@ -679,7 +856,9 @@ class Plan:
             "selector": self.selector,
             "pool": self.pool.name if self.pool is not None else None,
             "target": self.target.name,
-            "role": self.target.role,
+            "role": resolve_role(self.target, self.protocol),
+            "reach": list(self.target.reach),
+            "route": self.route,
             "protocol": self.protocol.name,
             "protocol_kind": self.protocol.kind,
             "profile": self.profile.name,
@@ -713,7 +892,28 @@ def build_plan(context: FleetContext, args: argparse.Namespace, verb: str) -> Pl
         selector=selector,
         pool=context.pools.get(selector) if selector else None,
         admin=admin,
+        routes=resolve_routes(target, getattr(args, "route", None)),
     )
+
+
+def resolve_routes(target: TargetRecord, requested: str | None) -> tuple[str, ...]:
+    """Return the routes to try for TARGET, in order.
+
+    `--route` picks one of the declared routes rather than inventing one: a route
+    fleetctl has never been told about is a guess about someone else's network,
+    and the failure it produces is a timeout rather than an error.
+    """
+    declared = target.reach or DEFAULT_REACH
+    if requested is None:
+        return declared
+    route = parse_route(requested, what=f"--route for target {target.name!r}")
+    if route not in declared:
+        raise FleetError(
+            f"--route {route!r} is not declared for {target.name!r}, which reaches "
+            f"through [{format_reach(declared)}]. Add it to `reach` in that "
+            "target's file if the path exists."
+        )
+    return (route,)
 
 
 def build_paths(
@@ -796,7 +996,7 @@ def load_repo_template(path: str, fallback: str) -> str:
 CONFIG_VERSION = 1
 
 CONFIG_KEYS = frozenset({"version", "defaults", "ssh"})
-CONFIG_DEFAULTS_KEYS = frozenset({"redact_sensitive_output"})
+CONFIG_DEFAULTS_KEYS: frozenset[str] = frozenset()
 CONFIG_SSH_KEYS = frozenset(
     {
         "user_known_hosts_file",
@@ -813,6 +1013,7 @@ TARGET_KEYS = frozenset(
         "transport",
         "role",
         "protocol",
+        "reach",
         "workdir",
         "tags",
         "secret_backend",
@@ -894,7 +1095,6 @@ SECRET_KEYS = frozenset(
         "auth",
         "identity_file",
         "password",
-        "proxy_jump",
         "identities_only",
         "forward_agent",
         "compression",
@@ -936,6 +1136,22 @@ DEPRECATED_POOL_KEYS: dict[str, str] = {
 }
 DEPRECATED_PROFILE_KEYS: dict[str, str] = {
     "kind": "derived from whether the profile defines `submit_command`",
+}
+DEPRECATED_SECRET_KEYS: dict[str, str] = {
+    "proxy_jump": (
+        "how a host is reached is inventory, not a credential; declare "
+        '`reach = ["direct", "via:<bridge>"]` on the target instead, which is '
+        "validated at load time, reported by `list --format topology`, and "
+        "carries the bridge's own fleet SSH settings. A waypoint that is not "
+        "itself a fleet target is still expressible as `[ssh_option] ProxyJump`"
+    ),
+}
+DEPRECATED_CONFIG_DEFAULTS_KEYS: dict[str, str] = {
+    "redact_sensitive_output": (
+        "nothing ever read it; `show --secret` redacts by default and "
+        "`--sensitive` asks for the real values one command at a time, which "
+        "beats a global switch that silently changes what every command prints"
+    ),
 }
 
 
@@ -1028,7 +1244,11 @@ def validate_config_file(raw: dict[str, Any], *, source: Path) -> None:
         raw.get("defaults", {}), what="`defaults`", source=source
     )
     reject_unknown_keys(
-        defaults, CONFIG_DEFAULTS_KEYS, what="fleet config `[defaults]`", source=source
+        defaults,
+        CONFIG_DEFAULTS_KEYS,
+        what="fleet config `[defaults]`",
+        source=source,
+        deprecated=DEPRECATED_CONFIG_DEFAULTS_KEYS,
     )
     ssh_section = check_table(raw.get("ssh", {}), what="`ssh`", source=source)
     reject_unknown_keys(
@@ -1140,6 +1360,9 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
                 else None
             ),
             protocol=optional_str(raw.get("protocol")),
+            reach=parse_reach(
+                raw.get("reach", DEFAULT_REACH), what=what, source=source
+            ),
             workdir=optional_str(raw.get("workdir")),
             tags=tuple(str(item) for item in raw.get("tags", [])),
             secret_backend=check_vocabulary(
@@ -1481,6 +1704,9 @@ def deprecated_key_warnings(paths: FleetPaths) -> list[str]:
         (paths.protocols_dir, DEPRECATED_PROTOCOL_KEYS),
         (paths.pools_dir, DEPRECATED_POOL_KEYS),
         (paths.profiles_dir, DEPRECATED_PROFILE_KEYS),
+        # Only the key name is ever reported, never a value: a secret file is
+        # named and inspected here, not printed.
+        (paths.secrets_dir, DEPRECATED_SECRET_KEYS),
     ):
         if not directory.exists():
             continue
@@ -1492,15 +1718,30 @@ def deprecated_key_warnings(paths: FleetPaths) -> list[str]:
                         f"{entry} still defines `{key}`, which fleetctl ignores: "
                         f"{why}. Run `fleetctl migrate-config`."
                     )
+    config_defaults = load_toml_file(paths.config_file, default={}).get("defaults")
+    if isinstance(config_defaults, dict):
+        for key, why in DEPRECATED_CONFIG_DEFAULTS_KEYS.items():
+            if key in config_defaults:
+                warnings.append(
+                    f"{paths.config_file} still defines `[defaults] {key}`, which "
+                    f"fleetctl ignores: {why}. Run `fleetctl migrate-config`."
+                )
     return warnings
 
 
 def parse_secret_dict(raw: dict[str, Any], *, source: Path | None = None) -> FleetSecret:
     """Parse one secret record from TOML-style data."""
     # A typo here is quiet and dangerous in a different way to the other
-    # loaders: `proxyjump` instead of `proxy_jump` drops the bridge hop and
-    # sends the connection straight at a host that is not directly reachable.
-    reject_unknown_keys(raw, SECRET_KEYS, what="secret record", source=source)
+    # loaders: a misspelled `identity_file` falls back to whatever the agent
+    # happens to offer, and a misspelled `port` reaches a different service on
+    # the same host.
+    reject_unknown_keys(
+        raw,
+        SECRET_KEYS,
+        what="secret record",
+        source=source,
+        deprecated=DEPRECATED_SECRET_KEYS,
+    )
     host = optional_str(raw.get("host"))
     user = optional_str(raw.get("user"))
     if not host or not user:
@@ -1515,7 +1756,6 @@ def parse_secret_dict(raw: dict[str, Any], *, source: Path | None = None) -> Fle
     )
     identity_file = optional_str(raw.get("identity_file"))
     password = optional_str(raw.get("password"))
-    proxy_jump = optional_str(raw.get("proxy_jump"))
     strict_host_key_checking = optional_str(raw.get("strict_host_key_checking"))
     if strict_host_key_checking is not None:
         check_vocabulary(
@@ -1536,7 +1776,6 @@ def parse_secret_dict(raw: dict[str, Any], *, source: Path | None = None) -> Fle
         auth=auth,
         identity_file=identity_file,
         password=password,
-        proxy_jump=proxy_jump,
         identities_only=bool(raw.get("identities_only", True)),
         forward_agent=bool(raw.get("forward_agent", False)),
         compression=bool(raw.get("compression", False)),
@@ -1931,8 +2170,8 @@ def ssh_env(secret: FleetSecret) -> dict[str, str]:
     return env
 
 
-def ssh_runtime_kwargs(context: FleetContext) -> dict[str, Any]:
-    """Return fleet-managed SSH runtime settings."""
+def base_ssh_runtime_kwargs(context: FleetContext) -> dict[str, Any]:
+    """Return the fleet-managed SSH settings that do not depend on the route."""
     ensure_private_dir(context.paths.state_home, mode=STATE_DIR_MODE)
     ensure_private_dir(context.paths.cache_home, mode=PRIVATE_DIR_MODE)
     ensure_private_dir(context.paths.control_dir, mode=PRIVATE_DIR_MODE)
@@ -1953,6 +2192,92 @@ def ssh_runtime_kwargs(context: FleetContext) -> dict[str, Any]:
     }
 
 
+def escape_ssh_percent(text: str) -> str:
+    """Double every `%` so the ssh running a ProxyCommand leaves it alone.
+
+    A ProxyCommand is percent-expanded by the ssh that spawns it, and OpenSSH
+    only knows %%, %h, %n, %p and %r there -- an unescaped `%C` in the bridge's
+    ControlPath would abort the connection with "unknown key".  Escaping the
+    inner options exactly once per level of nesting means each ssh in the chain
+    consumes one layer and the innermost one still sees its own `%C`, which is
+    what gives every hop its own multiplexed socket.
+    """
+    return text.replace("%", "%%")
+
+
+def build_proxy_command(
+    context: FleetContext,
+    route: str,
+    base: dict[str, Any],
+    *,
+    chain: tuple[str, ...] = (),
+) -> str | None:
+    """Render the ProxyCommand that carries a connection along ROUTE.
+
+    The hop is a full fleetctl connection to the bridge -- its own secret, and
+    the same private known_hosts, IdentitiesOnly, timeouts and control socket the
+    destination gets -- and it chains, because a bridge may itself be reached
+    through one.  `-W` forwards a stream and runs nothing, which is why using a
+    bridge is transport rather than execution and needs no admission check:
+    `fleetctl exec` against that same bridge is still refused.
+    """
+    bridge_name = route_bridge(route)
+    if bridge_name is None:
+        return None
+    if bridge_name in chain:
+        raise FleetError("reach cycle: " + " -> ".join((*chain, bridge_name)))
+    bridge = context.targets.get(bridge_name)
+    if bridge is None:
+        raise FleetError(
+            f"route {route!r} names unknown target {bridge_name!r}; run `fleetctl list`"
+        )
+    ensure_target_enabled(bridge)
+    secret = context.resolve_secret(bridge)
+    if secret.auth == "password":
+        raise FleetError(
+            f"bridge {bridge_name!r} authenticates with a password, which cannot "
+            "carry another connection: sshpass hands one password to the whole "
+            "process tree, so the hop and the destination would both read it. "
+            "Give the bridge a key -- it is the host every other host is reached "
+            "through."
+        )
+    parts = ["ssh", "-W", "%h:%p", "-p", str(secret.port)]
+    parts += [
+        escape_ssh_percent(part)
+        for part in ssh_option_parts(
+            secret,
+            proxy_command=build_proxy_command(
+                context,
+                bridge.reach[0] if bridge.reach else ROUTE_DIRECT,
+                base,
+                chain=(*chain, bridge_name),
+            ),
+            **base,
+        )
+    ]
+    parts.append(secret.target)
+    return shlex.join(parts)
+
+
+def ssh_runtime_kwargs(
+    context: FleetContext,
+    *,
+    target: TargetRecord | None = None,
+    route: str | None = None,
+) -> dict[str, Any]:
+    """Return fleet-managed SSH runtime settings, TARGET's hop included.
+
+    Without a target these are the host-independent settings.  With one, the
+    route's ProxyCommand is part of the runtime, so every builder that already
+    forwarded these kwargs carries the bridge without knowing it exists.
+    """
+    base = base_ssh_runtime_kwargs(context)
+    if target is None:
+        return base
+    chosen = route or (target.reach[0] if target.reach else ROUTE_DIRECT)
+    return {**base, "proxy_command": build_proxy_command(context, chosen, base)}
+
+
 def ssh_option_parts(
     secret: FleetSecret,
     *,
@@ -1960,6 +2285,7 @@ def ssh_option_parts(
     control_path: str | None = None,
     strict_host_key_checking: str | None = None,
     update_host_keys: bool = True,
+    proxy_command: str | None = None,
 ) -> list[str]:
     """Build stable OpenSSH options for one target."""
     options = [
@@ -1981,8 +2307,8 @@ def ssh_option_parts(
             "-o",
             f"ControlPath={control_path}",
         ]
-    if secret.proxy_jump:
-        options += ["-o", f"ProxyJump={secret.proxy_jump}"]
+    if proxy_command:
+        options += ["-o", f"ProxyCommand={proxy_command}"]
     if secret.identities_only:
         options += ["-o", "IdentitiesOnly=yes"]
     if secret.forward_agent:
@@ -2057,6 +2383,7 @@ def build_ssh_command(
     control_path: str | None = None,
     strict_host_key_checking: str | None = None,
     update_host_keys: bool = True,
+    proxy_command: str | None = None,
 ) -> list[str]:
     """Build one ssh command."""
     command = ssh_transport_prefix(secret) + ["ssh"]
@@ -2069,6 +2396,7 @@ def build_ssh_command(
         control_path=control_path,
         strict_host_key_checking=strict_host_key_checking,
         update_host_keys=update_host_keys,
+        proxy_command=proxy_command,
     )
     command.append(secret.target)
     if remote_command is not None:
@@ -2085,6 +2413,7 @@ def build_scp_command(
     control_path: str | None = None,
     strict_host_key_checking: str | None = None,
     update_host_keys: bool = True,
+    proxy_command: str | None = None,
 ) -> list[str]:
     """Build one scp command."""
     command = ssh_transport_prefix(secret) + ["scp", "-P", str(secret.port)]
@@ -2094,6 +2423,7 @@ def build_scp_command(
         control_path=control_path,
         strict_host_key_checking=strict_host_key_checking,
         update_host_keys=update_host_keys,
+        proxy_command=proxy_command,
     )
     command += [source, dest]
     return command
@@ -2106,6 +2436,7 @@ def build_rsync_transport(
     control_path: str | None = None,
     strict_host_key_checking: str | None = None,
     update_host_keys: bool = True,
+    proxy_command: str | None = None,
 ) -> str:
     """Build the SSH transport string for rsync."""
     parts = ssh_transport_prefix(secret) + ["ssh", "-p", str(secret.port)]
@@ -2115,6 +2446,7 @@ def build_rsync_transport(
         control_path=control_path,
         strict_host_key_checking=strict_host_key_checking,
         update_host_keys=update_host_keys,
+        proxy_command=proxy_command,
     )
     return shlex.join(parts)
 
@@ -2155,6 +2487,7 @@ def run_ssh_command(
     control_path: str | None = None,
     strict_host_key_checking: str | None = None,
     update_host_keys: bool = True,
+    proxy_command: str | None = None,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one ssh command with fleet defaults."""
@@ -2166,6 +2499,7 @@ def run_ssh_command(
         control_path=control_path,
         strict_host_key_checking=strict_host_key_checking,
         update_host_keys=update_host_keys,
+        proxy_command=proxy_command,
     )
     return run_command(
         command,
@@ -2551,6 +2885,7 @@ def target_display(
         "name": target.name,
         "transport": target.transport,
         "protocol": protocol_name,
+        "reach": list(target.reach),
         "workdir": target.workdir or "",
         "enabled": target.enabled,
         "tags": list(target.tags),
@@ -2602,14 +2937,19 @@ def queue_display(queue: QueueRecord) -> dict[str, Any]:
 
 
 def redact_secret(secret: FleetSecret) -> dict[str, Any]:
-    """Produce a safe secret preview."""
+    """Produce a safe secret preview.
+
+    The username used to come back verbatim next to a `<redacted>` host, which is
+    half a credential and most of the way to the other half.  What is left is
+    what you actually debug with: whether an identity is configured, which port,
+    and whether a password is on file.
+    """
     return {
         "host": "<redacted>",
-        "user": secret.user,
+        "user": "<redacted>",
         "port": secret.port,
         "auth": secret.auth,
         "identity_file": secret.identity_file or "",
-        "proxy_jump": secret.proxy_jump or "",
         "password_configured": secret.password is not None,
     }
 
@@ -2818,9 +3158,6 @@ def default_config_template() -> str:
     fallback = """\
 version = 1
 
-[defaults]
-redact_sensitive_output = true
-
 [ssh]
 user_known_hosts_file = "~/.local/state/fleet/known_hosts"
 strict_host_key_checking = "accept-new"
@@ -2877,6 +3214,9 @@ name = "{name}"
 enabled = true
 transport = "ssh"
 protocol = "direct"
+# Ordered, and tried in order: direct first, a bridge as the fallback.
+# `["direct", "via:<bridge>"]` suits a host that is only sometimes dialable.
+reach = ["direct"]
 workdir = "/srv/work"
 tags = ["example"]
 secret_backend = "file"
@@ -2930,8 +3270,14 @@ def int_setting(raw: dict[str, str], key: str, default: int) -> int:
     return int(value)
 
 
-def infer_secret_from_ssh_alias(alias: str) -> FleetSecret:
-    """Resolve one existing SSH alias from the local SSH client."""
+def infer_secret_from_ssh_alias(alias: str) -> tuple[FleetSecret, str | None]:
+    """Resolve one existing SSH alias, and report any waypoint it goes through.
+
+    The hop comes back separately rather than inside the secret: a ProxyJump out
+    of ~/.ssh/config is topology, and fleetctl wants it declared as `reach` on a
+    bridge target it can validate -- so `import-ssh` says so instead of quietly
+    copying an opaque string into the secret store.
+    """
     completed = run_command(
         ["ssh", "-G", alias],
         capture_output=True,
@@ -2951,13 +3297,14 @@ def infer_secret_from_ssh_alias(alias: str) -> FleetSecret:
         )
     identity_file = optional_str(raw.get("identityfile"))
     proxy_jump = optional_str(raw.get("proxyjump"))
-    return FleetSecret(
+    if proxy_jump and proxy_jump.strip().lower() == "none":
+        proxy_jump = None  # what `ssh -G` prints when no jump is configured
+    secret = FleetSecret(
         host=host,
         user=user,
         port=int_setting(raw, "port", 22),
         auth="key",
         identity_file=identity_file,
-        proxy_jump=proxy_jump,
         identities_only=raw.get("identitiesonly", "no").lower() == "yes",
         forward_agent=raw.get("forwardagent", "no").lower() == "yes",
         compression=raw.get("compression", "no").lower() == "yes",
@@ -2966,6 +3313,7 @@ def infer_secret_from_ssh_alias(alias: str) -> FleetSecret:
         server_alive_count_max=int_setting(raw, "serveralivecountmax", 3),
         strict_host_key_checking=optional_str(raw.get("stricthostkeychecking")),
     )
+    return secret, proxy_jump
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -3056,8 +3404,6 @@ def secret_to_toml(secret: FleetSecret) -> str:
         lines.append(f"identity_file = {toml_string(secret.identity_file)}")
     if secret.password:
         lines.append(f"password = {toml_string(secret.password)}")
-    if secret.proxy_jump:
-        lines.append(f"proxy_jump = {toml_string(secret.proxy_jump)}")
     lines.append(f"identities_only = {'true' if secret.identities_only else 'false'}")
     lines.append(f"forward_agent = {'true' if secret.forward_agent else 'false'}")
     lines.append(f"compression = {'true' if secret.compression else 'false'}")
@@ -3088,6 +3434,9 @@ def target_to_toml(target: TargetRecord) -> str:
         lines.append(f"role = {toml_string(target.role)}")
     if target.protocol:
         lines.append(f"protocol = {toml_string(target.protocol)}")
+    if target.reach != DEFAULT_REACH:
+        routes = ", ".join(toml_string(route) for route in target.reach)
+        lines.append(f"reach = [{routes}]")
     if target.workdir:
         lines.append(f"workdir = {toml_string(target.workdir)}")
     if target.tags:
@@ -3335,6 +3684,23 @@ def command_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def reach_dependents(context: FleetContext) -> dict[str, list[str]]:
+    """Map each bridge to the targets whose declared routes go through it.
+
+    This is the answer to "what stops working if the bridge dies", which the
+    fleet could not previously produce at all: the hop lived inside each
+    dependent's secret, so the dependency existed only in a file that must not be
+    read to answer a topology question.
+    """
+    dependents: dict[str, list[str]] = {}
+    for target in context.targets.values():
+        for route in target.reach:
+            bridge_name = route_bridge(route)
+            if bridge_name is not None:
+                dependents.setdefault(bridge_name, []).append(target.name)
+    return {name: sorted(users) for name, users in dependents.items()}
+
+
 def command_list(args: argparse.Namespace, context: FleetContext) -> int:
     """List configured targets."""
     if args.format == "ssh-hosts":
@@ -3344,6 +3710,28 @@ def command_list(args: argparse.Namespace, context: FleetContext) -> int:
             if args.tag and args.tag not in target.tags:
                 continue
             print(f"fleet:{target.name}")
+        return 0
+
+    if args.format == "topology":
+        carried = reach_dependents(context)
+        rows = []
+        for target in sorted(context.targets.values(), key=lambda item: item.name):
+            if args.tag and args.tag not in target.tags:
+                continue
+            rows.append(
+                {
+                    "name": target.name,
+                    "enabled": target.enabled,
+                    "role": resolve_role(target, context.resolve_protocol(target)),
+                    "reach": list(target.reach),
+                    "carries": carried.get(target.name, []),
+                }
+            )
+        emit_rows(
+            rows,
+            ["name", "enabled", "role", "reach", "carries"],
+            as_json=bool(args.json),
+        )
         return 0
 
     pool_index: dict[str, list[str]] = {}
@@ -3404,7 +3792,6 @@ def command_show(args: argparse.Namespace, context: FleetContext) -> int:
                     "port": secret.port,
                     "auth": secret.auth,
                     "identity_file": secret.identity_file or "",
-                    "proxy_jump": secret.proxy_jump or "",
                     "password_configured": secret.password is not None,
                 }
                 if args.sensitive
@@ -3506,11 +3893,15 @@ def command_import_ssh(args: argparse.Namespace, context: FleetContext) -> int:
             f"target {name!r} already exists; rerun with --force to overwrite"
         )
 
-    secret = infer_secret_from_ssh_alias(args.alias)
+    secret, hop = infer_secret_from_ssh_alias(args.alias)
+    reach = parse_reach(
+        args.reach or DEFAULT_REACH, what=f"--reach for target {name!r}"
+    )
     target = TargetRecord(
         name=name,
         role=args.role,
         protocol=args.protocol or "direct",
+        reach=reach,
         workdir=args.workdir,
         tags=tuple(args.tag),
         secret_backend="file",
@@ -3519,6 +3910,16 @@ def command_import_ssh(args: argparse.Namespace, context: FleetContext) -> int:
     )
     write_text_file(target_path, target_to_toml(target), mode=PRIVATE_FILE_MODE)
     write_text_file(secret_path, secret_to_toml(secret), mode=PRIVATE_FILE_MODE)
+    if hop and reach == DEFAULT_REACH:
+        # Naming the hop's host here would print a fact out of ~/.ssh/config that
+        # belongs in the secret store, so say what to do rather than what it is.
+        print(
+            f"note: ssh alias {args.alias!r} reaches its host through a ProxyJump, "
+            "which fleetctl did not copy into the secret. Import that waypoint as "
+            "its own target with `--role bridge`, then re-run this with "
+            "`--reach direct --reach via:<bridge>`.",
+            file=sys.stderr,
+        )
     if args.project_path:
         update_project_binding(
             context.paths.projects_file,
@@ -3756,29 +4157,51 @@ def strip_top_level_keys(text: str, keys: Iterable[str]) -> tuple[str, list[str]
     return "".join(kept), removed
 
 
+def strip_toml_table(text: str, name: str) -> tuple[str, bool]:
+    """Remove one whole top-level `[name]` table from a TOML document."""
+    kept: list[str] = []
+    inside = False
+    removed = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            inside = stripped in (f"[{name}]", f'["{name}"]', f"['{name}']")
+            removed = removed or inside
+        if inside:
+            continue
+        kept.append(line)
+    return "".join(kept), removed
+
+
 def bridge_dependents(context: FleetContext) -> tuple[dict[str, list[str]], list[str]]:
     """Map each target that is another target's SSH waypoint to who needs it.
 
-    The evidence is a secret's `proxy_jump`, so the matching happens over values
-    that must never be printed.  Only the conclusion is returned -- "numpi is the
-    waypoint for rtx1" -- never the host it resolved through.
+    Migration only.  The evidence is the deprecated `proxy_jump`, which no longer
+    survives parsing, so this reads the raw secret material -- and it reads values
+    that must never be printed, so only the conclusion comes back: "<the bridge>
+    is the waypoint for <the dependent>", never the host it resolved through.
     """
-    secrets: dict[str, FleetSecret] = {}
+    raws: dict[str, dict[str, Any]] = {}
     notes: list[str] = []
     for target in context.targets.values():
         try:
-            secrets[target.name] = context.resolve_secret(target)
+            raws[target.name], _ = context.resolve_secret_raw(target)
         except FleetError:
             notes.append(
                 f"could not read {target.name!r}'s secret, so it was neither "
                 "classified as a waypoint nor checked for one"
             )
-    by_host = {secret.host.lower(): name for name, secret in secrets.items()}
+    by_host = {
+        str(raw["host"]).lower(): name
+        for name, raw in raws.items()
+        if optional_str(raw.get("host"))
+    }
     dependents: dict[str, list[str]] = {}
-    for name, secret in secrets.items():
-        if not secret.proxy_jump:
+    for name, raw in raws.items():
+        declared = optional_str(raw.get("proxy_jump"))
+        if not declared:
             continue
-        hop = secret.proxy_jump.rsplit("@", 1)[-1].split(":", 1)[0].strip().lower()
+        hop = declared.rsplit("@", 1)[-1].split(":", 1)[0].strip().lower()
         owner = by_host.get(hop) or (hop if hop in context.targets else None)
         if owner is None:
             notes.append(
@@ -3845,6 +4268,14 @@ def command_migrate_config(args: argparse.Namespace) -> int:
         renames[old] = new
 
     dependents, notes = bridge_dependents(context)
+    # The inverse of `dependents`, so each hop can be lifted out of the secret and
+    # into the target that uses it.  Direct comes first: a bridge is the fallback,
+    # never the default path.
+    lifted_reach = {
+        user: (ROUTE_DIRECT, f"{ROUTE_VIA_PREFIX}{renames.get(owner, owner)}")
+        for owner, users in dependents.items()
+        for user in users
+    }
 
     # --- decide, and be able to say why ------------------------------------
     decisions: list[tuple[str, str, str, str]] = []  # name, new name, role, reason
@@ -3950,7 +4381,20 @@ def command_migrate_config(args: argparse.Namespace) -> int:
                     "one generation in `.prev`"
                 )
 
-            replacement = replace(target, name=new_name, role=role, secret_ref=secret_ref)
+            reach = target.reach
+            if reach == DEFAULT_REACH and old_name in lifted_reach:
+                reach = lifted_reach[old_name]
+                changes.append(
+                    f"targets.d/{new_name}.toml: reach = [{format_reach(reach)}] "
+                    "(lifted out of the secret's `proxy_jump`)"
+                )
+            replacement = replace(
+                target,
+                name=new_name,
+                role=role,
+                secret_ref=secret_ref,
+                reach=reach,
+            )
             destination = paths.targets_dir / f"{new_name}.toml"
             if source is not None and source != destination:
                 source.unlink()
@@ -3965,6 +4409,10 @@ def command_migrate_config(args: argparse.Namespace) -> int:
         for directory, staged_dir, dead in (
             (live.protocols_dir, paths.protocols_dir, DEPRECATED_PROTOCOL_KEYS),
             (live.profiles_dir, paths.profiles_dir, DEPRECATED_PROFILE_KEYS),
+            # Secrets are edited in place rather than re-serialized: rewriting one
+            # from a parsed record would drop anything the schema does not model,
+            # and these are the files you cannot afford to lose.
+            (live.secrets_dir, paths.secrets_dir, DEPRECATED_SECRET_KEYS),
         ):
             if not staged_dir.exists():
                 continue
@@ -3978,6 +4426,14 @@ def command_migrate_config(args: argparse.Namespace) -> int:
                     f"{directory.name}/{entry.name}: dropped "
                     + ", ".join(f"`{key}`" for key in removed)
                 )
+        # `[defaults]` held exactly one key and nothing ever read it.  Dropping
+        # the table rather than the key leaves no empty section behind.
+        if paths.config_file.exists():
+            text = paths.config_file.read_text(encoding="utf-8")
+            stripped, dropped = strip_toml_table(text, "defaults")
+            if dropped:
+                write_text_file(paths.config_file, stripped, mode=PRIVATE_FILE_MODE)
+                changes.append("config.toml: dropped `[defaults]`")
         # --- follow the renames through everything that names a target -----
         if renames:
             for pool in context.pools.values():
@@ -4770,7 +5226,6 @@ def probe_remote_prerequisites(context: FleetContext) -> list[str]:
     stays offline and instant.
     """
     problems: list[str] = []
-    runtime = ssh_runtime_kwargs(context)
     for target in sorted(context.targets.values(), key=lambda item: item.name):
         if not target.enabled:
             continue
@@ -4779,6 +5234,10 @@ def probe_remote_prerequisites(context: FleetContext) -> list[str]:
         except FleetError:
             continue  # already reported by the offline pass
         try:
+            # Per target, not hoisted out of the loop: the ProxyCommand is part
+            # of the runtime now, and a hoisted one would send every probe down
+            # the first target's route.
+            runtime = ssh_runtime_kwargs(context, target=target)
             completed = run_ssh_command(
                 secret,
                 allocate_tty=False,
@@ -4828,6 +5287,7 @@ def command_explain(args: argparse.Namespace, context: FleetContext) -> int:
         selector=selector,
         pool=context.pools.get(selector) if selector else None,
         admin=bool(args.admin),
+        routes=resolve_routes(target, getattr(args, "route", None)),
     )
     role = resolve_role(target, protocol)
     payload = plan.describe()
@@ -4961,6 +5421,10 @@ def command_doctor(args: argparse.Namespace) -> int:
         # A pool that cannot be selected from is a pool that aborts the first
         # command aimed at it.  `select_pool` is the only definition of pool
         # membership, so run the real thing rather than re-deriving it.
+        # The reach graph is inventory-wide, so it is checked once rather than
+        # per target: a missing bridge is one fault, not one per dependent.
+        problems.extend(context.reach_problems())
+
         for pool in context.pools.values():
             try:
                 context.select_pool(pool)
@@ -5028,6 +5492,30 @@ def command_doctor(args: argparse.Namespace) -> int:
         return 1
     return 0
 
+def add_route_flag(parser: argparse.ArgumentParser) -> None:
+    """Register `--route`, which pins one of a target's declared routes."""
+    parser.add_argument(
+        "--route",
+        metavar="ROUTE",
+        help='Use one declared route: "direct" or "via:<bridge>"',
+    )
+
+
+def add_connection_flags(parser: argparse.ArgumentParser) -> None:
+    """Register the flags every verb that opens a connection carries.
+
+    Nine subparsers repeated the same five lines for `--admin`, which is exactly
+    how a tenth verb ends up without it.  Admission and routing are both
+    properties of connecting to a host, so they are declared together, once.
+    """
+    parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Acknowledge a control-plane action on a role that repels this verb",
+    )
+    add_route_flag(parser)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser."""
     parser = argparse.ArgumentParser(prog="fleetctl")
@@ -5049,9 +5537,9 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--json", action="store_true", help="Emit JSON")
     list_parser.add_argument(
         "--format",
-        choices=["table", "ssh-hosts"],
+        choices=["table", "ssh-hosts", "topology"],
         default="table",
-        help="Output format",
+        help="Output format; `topology` reports routes and what each bridge carries",
     )
     list_parser.add_argument("--tag", help="Filter by one target tag")
     list_parser.set_defaults(handler=command_list)
@@ -5243,6 +5731,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Host-level work directory where projects land by default",
     )
     import_ssh_parser.add_argument(
+        "--reach",
+        action="append",
+        default=[],
+        metavar="ROUTE",
+        help=(
+            'Route to the host: "direct" or "via:<bridge>". Repeatable and '
+            "ordered -- pass it twice for a fallback. Defaults to direct only."
+        ),
+    )
+    import_ssh_parser.add_argument(
         "--tag",
         action="append",
         default=[],
@@ -5336,22 +5834,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     ssh_parser = subparsers.add_parser("ssh", help="Open an interactive SSH session")
     ssh_parser.add_argument("selector", nargs="?", help="Target or pool name")
-    ssh_parser.add_argument(
-        "--admin",
-        action="store_true",
-        help="Acknowledge a control-plane action on a role that repels this verb",
-    )
+    add_connection_flags(ssh_parser)
     ssh_parser.set_defaults(handler=command_ssh)
 
     smoke_parser = subparsers.add_parser("smoke", help="Run a remote smoke check")
     smoke_parser.add_argument("selector", nargs="?", help="Target or pool name")
     smoke_parser.add_argument("--profile", help="Execution profile override")
     smoke_parser.add_argument("--cwd", help="Remote working directory override")
-    smoke_parser.add_argument(
-        "--admin",
-        action="store_true",
-        help="Acknowledge a control-plane action on a role that repels this verb",
-    )
+    add_connection_flags(smoke_parser)
     smoke_parser.set_defaults(handler=command_smoke)
 
     exec_parser = subparsers.add_parser(
@@ -5362,11 +5852,7 @@ def build_parser() -> argparse.ArgumentParser:
     exec_parser.add_argument("--target", dest="selector_override", help="Target or pool name")
     exec_parser.add_argument("--profile", help="Execution profile override")
     exec_parser.add_argument("--cwd", help="Remote working directory override")
-    exec_parser.add_argument(
-        "--admin",
-        action="store_true",
-        help="Acknowledge a control-plane action on a role that repels this verb",
-    )
+    add_connection_flags(exec_parser)
     exec_parser.add_argument("--tty", action="store_true", help="Allocate a TTY")
     exec_parser.add_argument(
         "argv",
@@ -5388,11 +5874,7 @@ def build_parser() -> argparse.ArgumentParser:
     script_parser.add_argument("--target", dest="selector", help="Target or pool name")
     script_parser.add_argument("--profile", help="Execution profile override")
     script_parser.add_argument("--cwd", help="Remote working directory override")
-    script_parser.add_argument(
-        "--admin",
-        action="store_true",
-        help="Acknowledge a control-plane action on a role that repels this verb",
-    )
+    add_connection_flags(script_parser)
     script_parser.add_argument("--interpreter", help="Interpreter to prepend")
     script_parser.add_argument("--tty", action="store_true", help="Allocate a TTY")
     script_parser.add_argument(
@@ -5426,11 +5908,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Override a --delete safety refusal",
     )
-    sync_parser.add_argument(
-        "--admin",
-        action="store_true",
-        help="Acknowledge a control-plane action on a role that repels this verb",
-    )
+    add_connection_flags(sync_parser)
     sync_parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -5479,11 +5957,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="Arguments for direct-profile submissions after `--`",
     )
-    submit_parser.add_argument(
-        "--admin",
-        action="store_true",
-        help="Acknowledge a control-plane action on a role that repels this verb",
-    )
+    add_connection_flags(submit_parser)
     submit_parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -5499,11 +5973,7 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--target", dest="selector", help="Target or pool name")
     status_parser.add_argument("--profile", help="Execution profile override")
     status_parser.add_argument("--cwd", help="Remote working directory override")
-    status_parser.add_argument(
-        "--admin",
-        action="store_true",
-        help="Acknowledge a control-plane action on a role that repels this verb",
-    )
+    add_connection_flags(status_parser)
     status_parser.set_defaults(handler=command_job_status)
 
     logs_parser = job_subparsers.add_parser("logs", help="Fetch scheduler logs")
@@ -5511,11 +5981,7 @@ def build_parser() -> argparse.ArgumentParser:
     logs_parser.add_argument("--target", dest="selector", help="Target or pool name")
     logs_parser.add_argument("--profile", help="Execution profile override")
     logs_parser.add_argument("--cwd", help="Remote working directory override")
-    logs_parser.add_argument(
-        "--admin",
-        action="store_true",
-        help="Acknowledge a control-plane action on a role that repels this verb",
-    )
+    add_connection_flags(logs_parser)
     logs_parser.set_defaults(handler=command_job_logs)
 
     cancel_parser = job_subparsers.add_parser("cancel", help="Cancel scheduler jobs")
@@ -5523,11 +5989,7 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_parser.add_argument("--target", dest="selector", help="Target or pool name")
     cancel_parser.add_argument("--profile", help="Execution profile override")
     cancel_parser.add_argument("--cwd", help="Remote working directory override")
-    cancel_parser.add_argument(
-        "--admin",
-        action="store_true",
-        help="Acknowledge a control-plane action on a role that repels this verb",
-    )
+    add_connection_flags(cancel_parser)
     cancel_parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -5553,6 +6015,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show the plan as it would resolve with --admin",
     )
+    add_route_flag(explain_parser)
     explain_parser.add_argument("--json", action="store_true", help="Emit JSON")
     explain_parser.set_defaults(handler=command_explain)
 
