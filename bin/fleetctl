@@ -2627,6 +2627,28 @@ def emit(payload: dict[str, Any], *, as_json: bool) -> None:
     print(render_text_payload(payload))
 
 
+def emit_rows(
+    rows: list[dict[str, Any]],
+    columns: list[str],
+    *,
+    as_json: bool,
+    when_empty: str | None = None,
+) -> None:
+    """Print a list of records: JSON when asked, one fixed-width table otherwise.
+
+    `when_empty` names the case where having nothing to show is itself the
+    problem.  It applies to the table only -- an empty JSON list is a complete
+    and correct answer, and a caller piping `--json` into another program should
+    not have to catch an error to learn that a protocol has no queues.
+    """
+    if as_json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return
+    if not rows and when_empty is not None:
+        raise FleetError(when_empty)
+    print(format_table(rows, columns))
+
+
 def render_text_payload(value: Any, *, indent: int = 0) -> str:
     """Render nested plain data as readable indented lines."""
     pad = "  " * indent
@@ -2646,12 +2668,14 @@ def render_text_payload(value: Any, *, indent: int = 0) -> str:
     if isinstance(value, (list, tuple)):
         if not value:
             return f"{pad}(none)"
-        return "\n".join(
+        parts = [
             render_text_payload(item, indent=indent)
             if isinstance(item, (dict, list, tuple))
             else f"{pad}- {render_scalar(item)}"
             for item in value
-        )
+        ]
+        separator = "\n\n" if any(isinstance(item, dict) for item in value) else "\n"
+        return separator.join(parts)
     return f"{pad}{render_scalar(value)}"
 
 
@@ -2661,6 +2685,8 @@ def render_scalar(value: Any) -> str:
         return "-"
     if isinstance(value, (dict, list, tuple)) and not value:
         return "(none)"
+    if value == "":
+        return "-"
     if value is True:
         return "yes"
     if value is False:
@@ -3226,7 +3252,7 @@ def command_project_show(args: argparse.Namespace, context: FleetContext) -> int
         "remote_roots_by_target": dict(sorted(binding.remote_roots_by_target.items())),
         "sync_excludes": list(binding.sync_excludes),
     }
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    emit(payload, as_json=bool(args.json))
     return 0
 
 
@@ -3243,22 +3269,18 @@ def command_project_list(args: argparse.Namespace, context: FleetContext) -> int
         }
         for binding in sorted(context.projects, key=lambda item: str(item.path))
     ]
-    if args.json:
-        print(json.dumps(rows, indent=2, sort_keys=True))
-    else:
-        print(
-            format_table(
-                rows,
-                [
-                    "path",
-                    "default_target",
-                    "default_pool",
-                    "default_profile",
-                    "remote_root",
-                    "target_roots",
-                ],
-            )
-        )
+    emit_rows(
+        rows,
+        [
+            "path",
+            "default_target",
+            "default_pool",
+            "default_profile",
+            "remote_root",
+            "target_roots",
+        ],
+        as_json=bool(args.json),
+    )
     return 0
 
 
@@ -3342,24 +3364,20 @@ def command_list(args: argparse.Namespace, context: FleetContext) -> int:
                 pool_names=pool_index.get(target.name, []),
             )
         )
-    if args.json:
-        print(json.dumps(rows, indent=2, sort_keys=True))
-    else:
-        print(
-            format_table(
-                rows,
-                [
-                    "name",
-                    "enabled",
-                    "transport",
-                    "role",
-                    "protocol",
-                    "default_profile",
-                    "tags",
-                    "pools",
-                ],
-            )
-        )
+    emit_rows(
+        rows,
+        [
+            "name",
+            "enabled",
+            "transport",
+            "role",
+            "protocol",
+            "default_profile",
+            "tags",
+            "pools",
+        ],
+        as_json=bool(args.json),
+    )
     return 0
 
 
@@ -3408,7 +3426,7 @@ def command_show(args: argparse.Namespace, context: FleetContext) -> int:
     else:
         raise FleetError(f"unknown target or pool {args.selector!r}")
 
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    emit(payload, as_json=bool(args.json))
     return 0
 
 
@@ -3426,7 +3444,7 @@ def command_protocol_show(args: argparse.Namespace, context: FleetContext) -> in
         payload = protocol_display(protocol)
         payload["selector_kind"] = "target"
         payload["target"] = target.name
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    emit(payload, as_json=bool(args.json))
     return 0
 
 
@@ -3439,25 +3457,20 @@ def command_queue_list(args: argparse.Namespace, context: FleetContext) -> int:
         target, _binding = context.resolve_target(selector, cwd=Path.cwd())
         protocol = context.resolve_protocol(target)
     rows = [queue_display(queue) for queue in protocol.queues]
-    if args.json:
-        print(json.dumps(rows, indent=2, sort_keys=True))
-    else:
-        if not rows:
-            raise FleetError(f"protocol {protocol.name!r} does not define any queues")
-        print(
-            format_table(
-                rows,
-                [
-                    "name",
-                    "partition",
-                    "default",
-                    "gpus",
-                    "cpus_per_task",
-                    "mem",
-                    "time_limit",
-                ],
-            )
-        )
+    emit_rows(
+        rows,
+        [
+            "name",
+            "partition",
+            "default",
+            "gpus",
+            "cpus_per_task",
+            "mem",
+            "time_limit",
+        ],
+        as_json=bool(args.json),
+        when_empty=f"protocol {protocol.name!r} does not define any queues",
+    )
     return 0
 
 
@@ -3465,8 +3478,10 @@ def command_resolve(args: argparse.Namespace, context: FleetContext) -> int:
     """Resolve one pool or project binding to a concrete target name."""
     target, _binding = context.resolve_target(args.selector, cwd=Path.cwd())
     if args.json:
-        print(json.dumps({"target": target.name}, indent=2))
+        emit({"target": target.name}, as_json=True)
     else:
+        # The one command whose plain output is a value rather than a report:
+        # `resolve` exists to be substituted into another command line.
         print(target.name)
     return 0
 
@@ -4181,7 +4196,7 @@ def command_deploy_config(args: argparse.Namespace) -> int:
             "protocols": sorted(deployed.protocols),
             "profiles": sorted(deployed.profiles),
         }
-        print(json.dumps(payload, indent=2, sort_keys=True))
+        emit(payload, as_json=bool(args.json))
     else:
         print(live.config_home)
     return 0
@@ -5008,7 +5023,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "warnings": warnings,
         "problems": problems,
     }
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    emit(payload, as_json=bool(args.json))
     if problems:
         return 1
     return 0
@@ -5140,6 +5155,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         help="Project path to inspect (defaults to current directory)",
     )
+    project_show_parser.add_argument("--json", action="store_true", help="Emit JSON")
     project_show_parser.set_defaults(handler=command_project_show)
 
     project_list_parser = project_subparsers.add_parser(
@@ -5184,6 +5200,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print a short post-deploy summary after validation",
     )
+    deploy_config_parser.add_argument("--json", action="store_true", help="Emit JSON")
     deploy_config_parser.set_defaults(handler=command_deploy_config, loads_own_config=True)
 
     migrate_config_parser = subparsers.add_parser(
