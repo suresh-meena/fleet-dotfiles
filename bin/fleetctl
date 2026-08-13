@@ -53,6 +53,90 @@ DEFAULT_SYNC_EXCLUDES = [
     "*.pyc",
 ]
 
+# ---- SECTION: admission policy ---------------------------------------------
+#
+# What may be done to a machine is decided by its `role`, and by nothing else.
+# The whole policy is the table below, so it can be read in one screen.
+#
+# A role is a taint, in the Kubernetes sense: it *repels* work rather than
+# attracting it, and `--admin` is a toleration -- permission, never a
+# recommendation.  There is deliberately no role meaning "scheduler node where
+# direct execution is fine", so the state this tool exists to prevent cannot be
+# spelled in the config at all.
+#
+#   bridge       an SSH waypoint.  Its job is to be jumped through.
+#   login        a scheduler submission surface.  Compute goes through `submit`.
+#   compute      a node you hold directly and may run work on.
+#   workstation  a machine you own outright.  No scheduler.
+#   storage      a data mover.  Not a place to run anything.
+
+ALLOW = "allow"
+ADMIN = "admin"
+DENY = "deny"
+
+ROLES = ("bridge", "login", "compute", "workstation", "storage")
+VERBS = ("ssh", "exec", "script", "sync", "submit", "job")
+
+ROLE_MATRIX: dict[str, tuple[str, ...]] = {
+    #               ssh    exec   script sync   submit job
+    "bridge":      (ALLOW, ADMIN, DENY,  ADMIN, DENY,  DENY),
+    "login":       (ALLOW, ADMIN, ADMIN, ALLOW, ALLOW, ALLOW),
+    "compute":     (ALLOW, ALLOW, ALLOW, ALLOW, ALLOW, ALLOW),
+    "workstation": (ALLOW, ALLOW, ALLOW, ALLOW, ALLOW, DENY),
+    "storage":     (ALLOW, ADMIN, DENY,  ALLOW, DENY,  DENY),
+}
+
+# Why a verb is refused outright, so the error names the alternative instead of
+# just restating the rule.
+DENY_REASON = {
+    "exec": "run compute through `fleetctl submit`",
+    "script": "run compute through `fleetctl submit`",
+    "sync": "this role does not host project trees",
+    "submit": "this role is not a compute surface",
+    "job": "there is no scheduler here",
+}
+
+
+def resolve_role(target: "TargetRecord", protocol: "ProtocolRecord") -> str:
+    """Return TARGET's role, inferring one only while configs are unmigrated.
+
+    An explicit `role` always wins.  Without one, infer the safety level the
+    protocol already implied -- so an unmigrated fleet is never *less* guarded
+    than it was before roles existed -- and let `doctor` ask for a migration.
+    """
+    if target.role:
+        return target.role
+    return "login" if protocol.kind != "direct" else "workstation"
+
+
+def authorize(
+    verb: str,
+    target: "TargetRecord",
+    protocol: "ProtocolRecord",
+    *,
+    admin: bool = False,
+) -> str:
+    """Single admission chokepoint.  Every verb calls this before touching a host."""
+    if verb not in VERBS:  # pragma: no cover - guards against a typo in a caller
+        raise FleetError(f"internal error: {verb!r} is not an admission verb")
+    role = resolve_role(target, protocol)
+    decision = ROLE_MATRIX[role][VERBS.index(verb)]
+    if decision == ALLOW:
+        return role
+    if decision == ADMIN:
+        if admin:
+            return role
+        raise FleetError(
+            f"`fleetctl {verb}` on {target.name!r} reaches the control plane of a "
+            f"{role} node. Re-run with --admin if that is genuinely what you want; "
+            "it is permission, not a recommendation."
+        )
+    raise FleetError(
+        f"`fleetctl {verb}` is refused on {target.name!r}: it is a {role} node -- "
+        f"{DENY_REASON.get(verb, 'this verb does not apply to that role')}."
+    )
+
+
 EXEC_REMOTE_STUB = """\
 import base64
 import json
@@ -118,6 +202,7 @@ class TargetRecord:
     name: str
     enabled: bool = True
     transport: str = "ssh"
+    role: str | None = None
     protocol: str | None = None
     workdir: str | None = None
     tags: tuple[str, ...] = ()
@@ -528,6 +613,7 @@ TARGET_KEYS = frozenset(
         "name",
         "enabled",
         "transport",
+        "role",
         "protocol",
         "workdir",
         "tags",
@@ -815,6 +901,13 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
                 what=what,
                 key="transport",
                 source=source,
+            ),
+            role=(
+                check_vocabulary(
+                    str(raw["role"]), ROLES, what=what, key="role", source=source
+                )
+                if raw.get("role") is not None
+                else None
             ),
             protocol=optional_str(raw.get("protocol")),
             workdir=optional_str(raw.get("workdir")),
@@ -2042,22 +2135,6 @@ def sanitize_job_name(value: str) -> str:
     return cleaned[:128] or "fleet-job"
 
 
-def ensure_login_exec_allowed(
-    target: TargetRecord,
-    protocol: ProtocolRecord,
-    *,
-    allow_login: bool,
-) -> None:
-    """Require an explicit acknowledgment on scheduler-backed login surfaces."""
-    if protocol.allow_login_exec or allow_login:
-        return
-    raise FleetError(
-        f"target {target.name!r} uses protocol {protocol.name!r}; "
-        "direct login-surface execution requires `--login`, while compute jobs "
-        "should go through `fleetctl submit`"
-    )
-
-
 def resolve_queue(
     protocol: ProtocolRecord,
     requested: str | None,
@@ -2570,6 +2647,8 @@ def target_to_toml(target: TargetRecord) -> str:
         f"enabled = {'true' if target.enabled else 'false'}",
         f"transport = {toml_string(target.transport)}",
     ]
+    if target.role:
+        lines.append(f"role = {toml_string(target.role)}")
     if target.protocol:
         lines.append(f"protocol = {toml_string(target.protocol)}")
     if target.workdir:
@@ -3405,6 +3484,7 @@ def command_ssh(args: argparse.Namespace) -> int:
         cache_home=args.cache_home,
     )
     target, _binding = context.resolve_target(args.selector, cwd=Path.cwd())
+    authorize("ssh", target, context.resolve_protocol(target), admin=bool(args.admin))
     secret = context.resolve_secret(target)
     completed = run_ssh_command(
         secret,
@@ -3423,9 +3503,11 @@ def command_smoke(args: argparse.Namespace) -> int:
         cache_home=args.cache_home,
     )
     target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
+    protocol = context.resolve_protocol(target)
+    # `smoke` only reports on the host, so it rides the same rule as `ssh`.
+    authorize("ssh", target, protocol, admin=bool(args.admin))
     secret = context.resolve_secret(target)
     profile = context.resolve_profile(target, binding, args.profile)
-    protocol = context.resolve_protocol(target)
     workdir = target.workdir
     project_root = resolve_remote_root(target, binding, args.cwd)
     prelude = ""
@@ -3544,7 +3626,7 @@ def command_exec(args: argparse.Namespace) -> int:
         raise FleetError("`fleetctl exec` requires a command after `--`")
     target, binding = context.resolve_target(selector, cwd=Path.cwd())
     protocol = context.resolve_protocol(target)
-    ensure_login_exec_allowed(target, protocol, allow_login=bool(args.login))
+    authorize("exec", target, protocol, admin=bool(args.admin))
     secret = context.resolve_secret(target)
     profile = context.resolve_profile(target, binding, args.profile)
     cwd = resolve_remote_root(target, binding, args.cwd)
@@ -3583,7 +3665,7 @@ def command_script(args: argparse.Namespace) -> int:
     )
     target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
     protocol = context.resolve_protocol(target)
-    ensure_login_exec_allowed(target, protocol, allow_login=bool(args.login))
+    authorize("script", target, protocol, admin=bool(args.admin))
     secret = context.resolve_secret(target)
     profile = context.resolve_profile(target, binding, args.profile)
     ssh_runtime = ssh_runtime_kwargs(context)
@@ -3618,6 +3700,7 @@ def command_sync(args: argparse.Namespace) -> int:
         cache_home=args.cache_home,
     )
     target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
+    authorize("sync", target, context.resolve_protocol(target), admin=bool(args.admin))
     secret = context.resolve_secret(target)
     ssh_runtime = ssh_runtime_kwargs(context)
     default_remote = args.remote_path or resolve_remote_root(target, binding)
@@ -3690,6 +3773,7 @@ def command_submit(args: argparse.Namespace) -> int:
     )
     target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
     protocol = context.resolve_protocol(target)
+    authorize("submit", target, protocol, admin=bool(args.admin))
     secret = context.resolve_secret(target)
     profile = context.resolve_profile(target, binding, args.profile)
     ssh_runtime = ssh_runtime_kwargs(context)
@@ -3715,7 +3799,7 @@ def command_submit(args: argparse.Namespace) -> int:
             local_script=str(local_script),
             interpreter=args.interpreter,
             script_args=args.script_args,
-            login=False,
+            admin=bool(args.admin),
             tty=False,
         )
         return command_script(namespace)
@@ -3880,6 +3964,7 @@ def run_job_command(
         cache_home=args.cache_home,
     )
     target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
+    authorize("job", target, context.resolve_protocol(target), admin=bool(args.admin))
     secret = context.resolve_secret(target)
     profile = context.resolve_profile(target, binding, args.profile)
     cwd = resolve_remote_root(target, binding, args.cwd)
@@ -4472,12 +4557,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     ssh_parser = subparsers.add_parser("ssh", help="Open an interactive SSH session")
     ssh_parser.add_argument("selector", nargs="?", help="Target or pool name")
+    ssh_parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Acknowledge a control-plane action on a role that repels this verb",
+    )
     ssh_parser.set_defaults(handler=command_ssh)
 
     smoke_parser = subparsers.add_parser("smoke", help="Run a remote smoke check")
     smoke_parser.add_argument("selector", nargs="?", help="Target or pool name")
     smoke_parser.add_argument("--profile", help="Execution profile override")
     smoke_parser.add_argument("--cwd", help="Remote working directory override")
+    smoke_parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Acknowledge a control-plane action on a role that repels this verb",
+    )
     smoke_parser.set_defaults(handler=command_smoke)
 
     exec_parser = subparsers.add_parser(
@@ -4489,9 +4584,9 @@ def build_parser() -> argparse.ArgumentParser:
     exec_parser.add_argument("--profile", help="Execution profile override")
     exec_parser.add_argument("--cwd", help="Remote working directory override")
     exec_parser.add_argument(
-        "--login",
+        "--admin",
         action="store_true",
-        help="Acknowledge login-surface execution on scheduler-backed targets",
+        help="Acknowledge a control-plane action on a role that repels this verb",
     )
     exec_parser.add_argument("--tty", action="store_true", help="Allocate a TTY")
     exec_parser.add_argument(
@@ -4510,9 +4605,9 @@ def build_parser() -> argparse.ArgumentParser:
     script_parser.add_argument("--profile", help="Execution profile override")
     script_parser.add_argument("--cwd", help="Remote working directory override")
     script_parser.add_argument(
-        "--login",
+        "--admin",
         action="store_true",
-        help="Acknowledge direct script execution on a scheduler login surface",
+        help="Acknowledge a control-plane action on a role that repels this verb",
     )
     script_parser.add_argument("--interpreter", help="Interpreter to prepend")
     script_parser.add_argument("--tty", action="store_true", help="Allocate a TTY")
@@ -4541,6 +4636,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Override a --delete safety refusal",
+    )
+    sync_parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Acknowledge a control-plane action on a role that repels this verb",
     )
     sync_parser.set_defaults(handler=command_sync)
 
@@ -4585,6 +4685,11 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="Arguments for direct-profile submissions after `--`",
     )
+    submit_parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Acknowledge a control-plane action on a role that repels this verb",
+    )
     submit_parser.set_defaults(handler=command_submit)
 
     job_parser = subparsers.add_parser("job", help="Inspect or manage remote jobs")
@@ -4595,6 +4700,11 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--target", dest="selector", help="Target or pool name")
     status_parser.add_argument("--profile", help="Execution profile override")
     status_parser.add_argument("--cwd", help="Remote working directory override")
+    status_parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Acknowledge a control-plane action on a role that repels this verb",
+    )
     status_parser.set_defaults(handler=command_job_status)
 
     logs_parser = job_subparsers.add_parser("logs", help="Fetch scheduler logs")
@@ -4602,6 +4712,11 @@ def build_parser() -> argparse.ArgumentParser:
     logs_parser.add_argument("--target", dest="selector", help="Target or pool name")
     logs_parser.add_argument("--profile", help="Execution profile override")
     logs_parser.add_argument("--cwd", help="Remote working directory override")
+    logs_parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Acknowledge a control-plane action on a role that repels this verb",
+    )
     logs_parser.set_defaults(handler=command_job_logs)
 
     cancel_parser = job_subparsers.add_parser("cancel", help="Cancel scheduler jobs")
@@ -4609,6 +4724,11 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_parser.add_argument("--target", dest="selector", help="Target or pool name")
     cancel_parser.add_argument("--profile", help="Execution profile override")
     cancel_parser.add_argument("--cwd", help="Remote working directory override")
+    cancel_parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Acknowledge a control-plane action on a role that repels this verb",
+    )
     cancel_parser.set_defaults(handler=command_job_cancel)
 
     doctor_parser = subparsers.add_parser("doctor", help="Validate local fleet setup")
