@@ -754,14 +754,31 @@ def load_toml_file(path: Path, *, default: Any | None = None) -> dict[str, Any]:
     return data
 
 
-def load_records_from_dir(path: Path) -> list[tuple[str, dict[str, Any], Path]]:
+def load_records_from_dir(
+    path: Path,
+    *,
+    kind: str = "record",
+) -> list[tuple[str, dict[str, Any], Path]]:
     """Read every TOML file in PATH and return (name, raw, source_path)."""
     if not path.exists():
         return []
     records: list[tuple[str, dict[str, Any], Path]] = []
+    seen: dict[str, Path] = {}
     for entry in sorted(path.glob("*.toml")):
         raw = load_toml_file(entry)
         name = str(raw.get("name") or entry.stem)
+        # The record name, not the filename, is the key every loader builds its
+        # dict on, so two files claiming one name used to mean the
+        # alphabetically later file silently won.  That is how a target gets
+        # edited in one file and resolved from another.
+        if name in seen:
+            raise FleetError(
+                f"duplicate {kind} name {name!r}: declared in both "
+                f"{seen[name].name} and {entry.name} under {path}. Names are "
+                "how fleetctl identifies records, so exactly one file may "
+                "claim each one."
+            )
+        seen[name] = entry
         records.append((name, raw, entry))
     return records
 
@@ -779,7 +796,7 @@ TARGET_FILE_WARNINGS: dict[str, str] = {
 def load_targets(path: Path) -> dict[str, TargetRecord]:
     """Load target metadata files."""
     targets: dict[str, TargetRecord] = {}
-    for name, raw, source in load_records_from_dir(path):
+    for name, raw, source in load_records_from_dir(path, kind="target"):
         what = f"target {name!r}"
         check_version(raw, what=what, source=source)
         reject_unknown_keys(
@@ -833,7 +850,7 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
 def load_pools(path: Path) -> dict[str, PoolRecord]:
     """Load pool metadata files."""
     pools: dict[str, PoolRecord] = {}
-    for name, raw, source in load_records_from_dir(path):
+    for name, raw, source in load_records_from_dir(path, kind="pool"):
         what = f"pool {name!r}"
         check_version(raw, what=what, source=source)
         reject_unknown_keys(raw, POOL_KEYS, what=what, source=source)
@@ -899,7 +916,7 @@ def built_in_protocols() -> dict[str, ProtocolRecord]:
 def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
     """Load protocol definitions and merge them over the built-ins."""
     protocols = built_in_protocols()
-    for name, raw, source in load_records_from_dir(path):
+    for name, raw, source in load_records_from_dir(path, kind="protocol"):
         what = f"protocol {name!r}"
         check_version(raw, what=what, source=source)
         reject_unknown_keys(raw, PROTOCOL_KEYS, what=what, source=source)
@@ -995,7 +1012,7 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
 def load_profiles(path: Path) -> dict[str, ProfileRecord]:
     """Load execution profile files."""
     profiles: dict[str, ProfileRecord] = {}
-    for name, raw, source in load_records_from_dir(path):
+    for name, raw, source in load_records_from_dir(path, kind="profile"):
         what = f"profile {name!r}"
         check_version(raw, what=what, source=source)
         reject_unknown_keys(raw, PROFILE_KEYS, what=what, source=source)
