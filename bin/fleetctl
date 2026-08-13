@@ -958,7 +958,8 @@ def ensure_sync_delete_allowed(
     if normalized in UNSAFE_SYNC_DELETE_ROOTS:
         raise FleetError(
             f"refusing `--delete` against remote path {remote_path!r} on "
-            f"{target.name!r}: that is a home directory, not a project directory"
+            f"{target.name!r}: that is a whole home or root directory, not a "
+            "project directory"
         )
     if target.workdir and normalized == target.workdir.rstrip("/") and not force:
         raise FleetError(
@@ -3419,14 +3420,49 @@ def command_job_cancel(args: argparse.Namespace) -> int:
     return run_job_command(args, profile.cancel_command)
 
 
+def toml_syntax_problems(paths: FleetPaths) -> list[str]:
+    """Report every config file that fails to parse, not just the first one.
+
+    Only positions are reported, never file content, because this walks
+    `secrets/` too.
+    """
+    candidates = [paths.config_file, paths.projects_file]
+    for directory in (
+        paths.targets_dir,
+        paths.pools_dir,
+        paths.protocols_dir,
+        paths.profiles_dir,
+        paths.secrets_dir,
+    ):
+        if directory.is_dir():
+            candidates.extend(sorted(directory.glob("*.toml")))
+    problems: list[str] = []
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            with candidate.open("rb") as handle:
+                tomllib.load(handle)
+        except tomllib.TOMLDecodeError as exc:
+            problems.append(f"invalid TOML in {candidate}: {exc}")
+        except OSError as exc:
+            problems.append(f"cannot read {candidate}: {exc}")
+    return problems
+
+
 def command_doctor(args: argparse.Namespace) -> int:
-    """Validate local prerequisites and private file permissions."""
-    context = FleetContext.load(
+    """Validate local prerequisites and private file permissions.
+
+    Deliberately does not require the config to load: one unparseable file used
+    to abort the command whose whole job is to find it.  Path, permission and
+    tool checks always run, every broken file is named, and the checks that do
+    need a loaded fleet are skipped with the reason reported.
+    """
+    paths = build_paths(
         config_home=args.config_home,
         state_home=args.state_home,
         cache_home=args.cache_home,
     )
-    paths = context.paths
     problems: list[str] = []
     warnings: list[str] = []
 
@@ -3453,63 +3489,81 @@ def command_doctor(args: argparse.Namespace) -> int:
         if shutil.which(command_name) is None:
             problems.append(f"missing required command: {command_name}")
 
-    warnings.extend(target_schema_warnings(paths.targets_dir))
+    problems.extend(toml_syntax_problems(paths))
+    try:
+        warnings.extend(target_schema_warnings(paths.targets_dir))
+    except FleetError:
+        pass  # already reported precisely by toml_syntax_problems above
 
-    for target in context.targets.values():
-        try:
-            protocol = context.resolve_protocol(target)
-        except FleetError as exc:
-            problems.append(str(exc))
-            continue
-        try:
-            secret = context.resolve_secret(target)
-        except FleetError as exc:
-            problems.append(str(exc))
-            continue
-        if target.secret_backend == "file" and target.secret_ref:
-            secret_path = expand_local_path(target.secret_ref)
-            if secret_path.exists():
-                mode = stat.S_IMODE(secret_path.stat().st_mode)
-                if mode & 0o077:
+    stale = paths.config_home.with_name(paths.config_home.name + ".new")
+    if stale.exists():
+        warnings.append(
+            f"leftover staging tree from an interrupted `deploy-config`: {stale}"
+        )
+
+    context: FleetContext | None
+    try:
+        context = FleetContext.load(
+            config_home=args.config_home,
+            state_home=args.state_home,
+            cache_home=args.cache_home,
+        )
+    except FleetError as exc:
+        problems.append(f"fleet config does not load: {exc}")
+        context = None
+
+    if context is not None:
+        for target in context.targets.values():
+            try:
+                protocol = context.resolve_protocol(target)
+            except FleetError as exc:
+                problems.append(str(exc))
+                continue
+            try:
+                secret = context.resolve_secret(target)
+            except FleetError as exc:
+                problems.append(str(exc))
+                continue
+            if target.secret_backend == "file" and target.secret_ref:
+                secret_path = expand_local_path(target.secret_ref)
+                if secret_path.exists():
+                    mode = stat.S_IMODE(secret_path.stat().st_mode)
+                    if mode & 0o077:
+                        problems.append(
+                            f"secret file is too permissive ({oct(mode)}): {secret_path}"
+                        )
+            if secret.auth == "password":
+                if shutil.which("sshpass") is None:
                     problems.append(
-                        f"secret file is too permissive ({oct(mode)}): {secret_path}"
+                        f"target {target.name!r} uses password auth but `sshpass` is missing"
                     )
-        if secret.auth == "password":
-            if shutil.which("sshpass") is None:
-                problems.append(
-                    f"target {target.name!r} uses password auth but `sshpass` is missing"
-                )
-        if protocol.kind == "slurm" and not protocol.queues:
-            warnings.append(
-                f"target {target.name!r} uses Slurm protocol {protocol.name!r} "
-                "without any queue presets"
-            )
-
-    for binding in context.projects:
-        for target_name in sorted(binding.remote_roots_by_target):
-            if target_name not in context.targets:
+            if protocol.kind == "slurm" and not protocol.queues:
                 warnings.append(
-                    f"project binding {binding.path} defines a landing strip for "
-                    f"unknown target {target_name!r}"
+                    f"target {target.name!r} uses Slurm protocol {protocol.name!r} "
+                    "without any queue presets"
                 )
+
+        for binding in context.projects:
+            for target_name in sorted(binding.remote_roots_by_target):
+                if target_name not in context.targets:
+                    warnings.append(
+                        f"project binding {binding.path} defines a landing strip for "
+                        f"unknown target {target_name!r}"
+                    )
 
     payload = {
         "config_home": str(paths.config_home),
-        "targets": sorted(context.targets),
-        "pools": sorted(context.pools),
-        "protocols": sorted(context.protocols),
-        "profiles": sorted(context.profiles),
+        "targets": sorted(context.targets) if context else [],
+        "pools": sorted(context.pools) if context else [],
+        "protocols": sorted(context.protocols) if context else [],
+        "profiles": sorted(context.profiles) if context else [],
         "warnings": warnings,
         "problems": problems,
     }
-    if args.json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        print(json.dumps(payload, indent=2, sort_keys=True))
+    print(json.dumps(payload, indent=2, sort_keys=True))
     if problems:
         return 1
     return 0
-
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser."""
