@@ -1370,11 +1370,35 @@ def render_template_values(
     return rendered
 
 
+def quote_remote_path(path: str) -> str:
+    """Quote a fleet-resolved remote path, keeping a leading `~/` expandable.
+
+    `shlex.quote("~/work")` yields `'~/work'`, and no shell expands a quoted
+    tilde, so every `~`-relative workdir failed with "remote cwd not found".
+    Emitting `$HOME` unquoted with the remainder quoted keeps the expansion while
+    staying safe for paths containing spaces or quotes.
+    """
+    if path in ("~", "$HOME"):
+        return "$HOME"
+    for prefix in ("~/", "$HOME/"):
+        if path.startswith(prefix):
+            remainder = path[len(prefix) :]
+            return f"$HOME/{shlex.quote(remainder)}" if remainder else "$HOME"
+    return shlex.quote(path)
+
+
+def remote_shell_path_command(argv: list[str], remote_path: str) -> str:
+    """Build a remote command whose final argument is a fleet-resolved path."""
+    return shlex.join(
+        ["/bin/sh", "-c", f"{shlex.join(argv)} {quote_remote_path(remote_path)}"]
+    )
+
+
 def remote_shell_command(command: list[str], *, cwd: str | None = None) -> str:
     """Build a remote shell command from argv."""
     inner = shlex.join(command)
     if cwd:
-        quoted_cwd = shlex.quote(cwd)
+        quoted_cwd = quote_remote_path(cwd)
         inner = (
             f"if [ -d {quoted_cwd} ]; then cd {quoted_cwd};"
             f" else printf 'error: remote cwd not found: %s\\n' {quoted_cwd} >&2;"
@@ -1442,7 +1466,7 @@ def stage_remote_script(
     mkdir = run_ssh_command(
         secret,
         allocate_tty=False,
-        remote_command=remote_shell_command(["mkdir", "-p", remote_dir]),
+        remote_command=remote_shell_path_command(["mkdir", "-p"], remote_dir),
         timeout=CONTROL_COMMAND_TIMEOUT,
         **ssh_runtime,
     )
@@ -1470,7 +1494,7 @@ def stage_remote_script(
     chmod = run_ssh_command(
         secret,
         allocate_tty=False,
-        remote_command=remote_shell_command(["chmod", "700", remote_path]),
+        remote_command=remote_shell_path_command(["chmod", "700"], remote_path),
         timeout=CONTROL_COMMAND_TIMEOUT,
         **ssh_runtime,
     )
@@ -1502,7 +1526,7 @@ def ensure_remote_directory(
     mkdir = run_ssh_command(
         secret,
         allocate_tty=False,
-        remote_command=remote_shell_command(["mkdir", "-p", remote_path]),
+        remote_command=remote_shell_path_command(["mkdir", "-p"], remote_path),
         timeout=CONTROL_COMMAND_TIMEOUT,
         **(ssh_runtime or {}),
     )
@@ -3133,7 +3157,7 @@ def command_sync(args: argparse.Namespace) -> int:
         mkdir = run_ssh_command(
             secret,
             allocate_tty=False,
-            remote_command=remote_shell_command(["mkdir", "-p", remote_parent]),
+            remote_command=remote_shell_path_command(["mkdir", "-p"], remote_parent),
             timeout=CONTROL_COMMAND_TIMEOUT,
             **ssh_runtime,
         )
