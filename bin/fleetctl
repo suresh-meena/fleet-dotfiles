@@ -1243,6 +1243,10 @@ def resolve_remote_root(
     return target.workdir
 
 
+# ssh reserves this exit status for its own failures, so a command exiting 255
+# means the connection died rather than the remote command failing.
+SSH_TRANSPORT_FAILURE = 255
+
 CONTROL_COMMAND_TIMEOUT = 60.0
 SUBMIT_COMMAND_TIMEOUT = 120.0
 PASS_COMMAND_TIMEOUT = 120.0
@@ -3967,7 +3971,15 @@ def probe_remote_prerequisites(context: FleetContext) -> list[str]:
         except FleetError as exc:
             problems.append(f"target {target.name!r} is not reachable: {exc}")
             continue
-        if completed.returncode != 0:
+        if completed.returncode == SSH_TRANSPORT_FAILURE:
+            # ssh reserves 255 for its own failures, so this is a transport
+            # problem, not a missing interpreter -- do not blame python3 for it.
+            detail = (completed.stderr or "").strip().splitlines()
+            problems.append(
+                f"target {target.name!r} is not reachable: "
+                + (detail[-1] if detail else "ssh failed with no diagnostic")
+            )
+        elif completed.returncode != 0:
             problems.append(
                 f"target {target.name!r} has no `python3` on PATH; `fleetctl exec` "
                 "runs its payload through a remote Python stub and will fail there"
