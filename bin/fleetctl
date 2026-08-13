@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -552,8 +552,13 @@ class FleetContext:
         check_protocol_profile(target, protocol, profile)
         return profile
 
-    def resolve_protocol(self, target: TargetRecord) -> ProtocolRecord:
-        """Resolve the behavior protocol for TARGET."""
+    def protocol_for(self, target: TargetRecord) -> ProtocolRecord:
+        """Look up TARGET's protocol without judging whether the two agree.
+
+        Only migrate-config wants this: it has to read a stale target's protocol
+        in order to repair the target, so it cannot require the target to already
+        be coherent.  Everything else goes through resolve_protocol().
+        """
         chosen = target.protocol
         if chosen is None:
             raise FleetError(
@@ -564,6 +569,11 @@ class FleetContext:
             raise FleetError(
                 f"target {target.name!r} refers to unknown protocol {chosen!r}"
             )
+        return protocol
+
+    def resolve_protocol(self, target: TargetRecord) -> ProtocolRecord:
+        """Resolve the behavior protocol for TARGET."""
+        protocol = self.protocol_for(target)
         check_role_protocol(target, protocol)
         return protocol
 
@@ -2491,25 +2501,25 @@ def serialize_projects(projects: list[ProjectBinding]) -> str:
     for item in sorted(projects, key=lambda binding: str(binding.path)):
         lines += [
             "[[project]]",
-            f'path = "{item.path}"',
+            f"path = {toml_string(str(item.path))}",
         ]
         if item.default_target:
-            lines.append(f'default_target = "{item.default_target}"')
+            lines.append(f"default_target = {toml_string(item.default_target)}")
         if item.default_pool:
-            lines.append(f'default_pool = "{item.default_pool}"')
+            lines.append(f"default_pool = {toml_string(item.default_pool)}")
         if item.default_profile:
-            lines.append(f'default_profile = "{item.default_profile}"')
+            lines.append(f"default_profile = {toml_string(item.default_profile)}")
         if item.remote_root:
-            lines.append(f'remote_root = "{item.remote_root}"')
+            lines.append(f"remote_root = {toml_string(item.remote_root)}")
         for target_name, remote_root in sorted(item.remote_roots_by_target.items()):
             lines += [
                 "",
                 "[[project.target_root]]",
-                f'target = "{target_name}"',
-                f'remote_root = "{remote_root}"',
+                f"target = {toml_string(target_name)}",
+                f"remote_root = {toml_string(remote_root)}",
             ]
         if item.sync_excludes:
-            quoted = ", ".join(f'"{entry}"' for entry in item.sync_excludes)
+            quoted = ", ".join(toml_string(entry) for entry in item.sync_excludes)
             lines.append(f"sync_excludes = [{quoted}]")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
@@ -3491,6 +3501,371 @@ def command_seed_pass(args: argparse.Namespace) -> int:
 
     for entry in written:
         print(entry)
+    return 0
+
+
+def pool_to_toml(pool: PoolRecord) -> str:
+    """Serialize a pool file."""
+    lines = [
+        "version = 1",
+        f"name = {toml_string(pool.name)}",
+    ]
+    if pool.targets:
+        members = ", ".join(toml_string(name) for name in pool.targets)
+        lines.append(f"targets = [{members}]")
+    if pool.match_tags:
+        tags = ", ".join(toml_string(tag) for tag in pool.match_tags)
+        lines.append(f"match_tags = [{tags}]")
+    lines.append(f"strategy = {toml_string(pool.strategy)}")
+    if pool.default_profile:
+        lines.append(f"default_profile = {toml_string(pool.default_profile)}")
+    return "\n".join(lines) + "\n"
+
+
+def strip_top_level_keys(text: str, keys: Iterable[str]) -> tuple[str, list[str]]:
+    """Delete top-level `key = value` lines, leaving every other byte alone.
+
+    Protocol files carry `[[queue]]` tables and hand-written comments, and there
+    is no round-trip serializer for them, so a rewrite would lose both.  Only
+    lines above the first table header are considered: that is where TOML puts
+    top-level keys, and a `kind` inside `[[queue]]` is a different key that must
+    survive.  Callers pass only scalar keys, so no value can span lines.
+    """
+    wanted = set(keys)
+    kept: list[str] = []
+    removed: list[str] = []
+    reached_tables = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            reached_tables = True
+        if not reached_tables and "=" in stripped and not stripped.startswith("#"):
+            key = stripped.split("=", 1)[0].strip().strip("\"'")
+            if key in wanted:
+                removed.append(key)
+                continue
+        kept.append(line)
+    return "".join(kept), removed
+
+
+def bridge_dependents(context: FleetContext) -> tuple[dict[str, list[str]], list[str]]:
+    """Map each target that is another target's SSH waypoint to who needs it.
+
+    The evidence is a secret's `proxy_jump`, so the matching happens over values
+    that must never be printed.  Only the conclusion is returned -- "numpi is the
+    waypoint for rtx1" -- never the host it resolved through.
+    """
+    secrets: dict[str, FleetSecret] = {}
+    notes: list[str] = []
+    for target in context.targets.values():
+        try:
+            secrets[target.name] = context.resolve_secret(target)
+        except FleetError:
+            notes.append(
+                f"could not read {target.name!r}'s secret, so it was neither "
+                "classified as a waypoint nor checked for one"
+            )
+    by_host = {secret.host.lower(): name for name, secret in secrets.items()}
+    dependents: dict[str, list[str]] = {}
+    for name, secret in secrets.items():
+        if not secret.proxy_jump:
+            continue
+        hop = secret.proxy_jump.rsplit("@", 1)[-1].split(":", 1)[0].strip().lower()
+        owner = by_host.get(hop) or (hop if hop in context.targets else None)
+        if owner is None:
+            notes.append(
+                f"{name!r} is reached through a waypoint that is not itself a fleet "
+                "target, so fleetctl cannot validate or reuse that hop; import it "
+                "with `fleetctl import-ssh --role bridge`"
+            )
+            continue
+        dependents.setdefault(owner, []).append(name)
+    return {name: sorted(users) for name, users in dependents.items()}, notes
+
+
+def parse_assignment(raw: str, *, flag: str) -> tuple[str, str]:
+    """Parse a `NAME=VALUE` command-line assignment."""
+    name, separator, value = raw.partition("=")
+    if not separator or not name.strip() or not value.strip():
+        raise FleetError(f"`{flag}` expects NAME=VALUE, got {raw!r}")
+    return name.strip(), value.strip()
+
+
+def command_migrate_config(args: argparse.Namespace) -> int:
+    """Write today's schema into the live fleet config, once.
+
+    Idempotent: a second run finds every role declared and every dead key gone,
+    and changes nothing.  The new tree is rendered and validated in a sibling
+    staging directory and swapped in by rename, so a migration that would produce
+    an unloadable config leaves the working one untouched.
+    """
+    live = build_paths(
+        config_home=args.config_home,
+        state_home=args.state_home,
+        cache_home=args.cache_home,
+    )
+    # Non-strict: this is the tool you reach for *because* the config is stale.
+    context = FleetContext.load(
+        config_home=args.config_home,
+        state_home=args.state_home,
+        cache_home=args.cache_home,
+        strict=False,
+    )
+    if not context.targets:
+        raise FleetError(f"no targets found under {live.targets_dir}")
+
+    overrides: dict[str, str] = {}
+    for raw in args.role:
+        name, role = parse_assignment(raw, flag="--role")
+        if name not in context.targets:
+            raise FleetError(f"--role names unknown target {name!r}; run `fleetctl list`")
+        if role not in ROLES:
+            raise FleetError(
+                f"--role {name}={role}: {role!r} is not one of {', '.join(ROLES)}"
+            )
+        overrides[name] = role
+
+    renames: dict[str, str] = {}
+    for raw in args.rename:
+        old, new = parse_assignment(raw, flag="--rename")
+        if old not in context.targets:
+            raise FleetError(f"--rename names unknown target {old!r}; run `fleetctl list`")
+        if new in context.targets:
+            raise FleetError(f"--rename target {new!r} already exists")
+        if new != Path(new).name or new.startswith("."):
+            raise FleetError(f"--rename target {new!r} is not a usable file name")
+        renames[old] = new
+
+    dependents, notes = bridge_dependents(context)
+
+    # --- decide, and be able to say why ------------------------------------
+    decisions: list[tuple[str, str, str, str]] = []  # name, new name, role, reason
+    blockers: list[str] = []
+    for name in sorted(context.targets):
+        target = context.targets[name]
+        try:
+            protocol = context.protocol_for(target)
+        except FleetError as exc:
+            blockers.append(f"{name}: {exc}")
+            continue
+        if name in overrides:
+            role, why = overrides[name], "you named it on the command line"
+        elif target.role:
+            role, why = target.role, "already declared"
+        elif name in dependents:
+            role = "bridge"
+            why = "it is the SSH waypoint for " + ", ".join(dependents[name])
+        else:
+            role = resolve_role(target, protocol)
+            why = (
+                f"protocol {protocol.name!r} is scheduler-backed"
+                if role == "login"
+                else f"protocol {protocol.name!r} runs work directly"
+            )
+        # target_to_toml() cannot express these, so a rewrite would drop them.
+        if target.metadata:
+            blockers.append(
+                f"{name}: defines `metadata`, which fleetctl does not read and this "
+                "rewrite would silently drop; delete it by hand first"
+            )
+        if target.secret_inline:
+            blockers.append(
+                f"{name}: keeps its connection details in an inline `[secret]` table, "
+                "which this rewrite would drop; move it to a secret file first"
+            )
+        decisions.append((name, renames.get(name, name), role, why))
+
+    if blockers:
+        raise FleetError(
+            "cannot migrate this config:\n  - " + "\n  - ".join(blockers)
+        )
+
+    staging_root = live.config_home.with_name(live.config_home.name + ".new")
+    if staging_root.exists():
+        shutil.rmtree(staging_root)
+    paths = build_paths(
+        config_home=staging_root,
+        state_home=args.state_home,
+        cache_home=args.cache_home,
+    )
+    changes: list[str] = []
+    previous: Path | None = None
+    try:
+        shutil.copytree(live.config_home, staging_root, symlinks=True)
+
+        # The loader keys targets on the declared `name`, not the file name, so
+        # find each record's real file rather than assuming they agree.
+        sources: dict[str, Path] = {}
+        for entry in sorted(paths.targets_dir.glob("*.toml")):
+            try:
+                raw = tomllib.loads(entry.read_text(encoding="utf-8"))
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+            sources[str(raw.get("name") or entry.stem)] = entry
+
+        # --- targets: explicit role, no dead keys, new name if asked --------
+        for old_name, new_name, role, _why in decisions:
+            target = context.targets[old_name]
+            source = sources.get(old_name)
+            secret_ref = target.secret_ref
+            if old_name != new_name and target.secret_backend == "file" and secret_ref:
+                stem = f"{old_name}.toml"
+                fleet_owned = (
+                    expand_local_path(secret_ref) == live.secrets_dir / stem
+                    and secret_ref.endswith(stem)
+                )
+                if fleet_owned:
+                    staged_old = paths.secrets_dir / stem
+                    if staged_old.exists():
+                        os.replace(staged_old, paths.secrets_dir / f"{new_name}.toml")
+                    # Rewrite only the last component, so `~/.config/fleet/...`
+                    # keeps the spelling the operator chose.
+                    secret_ref = secret_ref[: -len(stem)] + f"{new_name}.toml"
+                    changes.append(f"secrets/{stem} -> secrets/{new_name}.toml")
+                else:
+                    notes.append(
+                        f"{new_name!r} keeps pointing at {stem} because its secret_ref "
+                        "is not a plain path into the fleet secrets directory"
+                    )
+            # Targets are re-serialized whole, so a dead key disappears without
+            # being asked to -- but only if something puts the migration on the
+            # change list, which is what decides whether the swap happens at all.
+            original = source.read_text(encoding="utf-8") if source else ""
+            _, dead = strip_top_level_keys(original, DEPRECATED_TARGET_KEYS)
+            for key in dead:
+                changes.append(f"targets.d/{new_name}.toml: dropped `{key}`")
+            comments = sum(1 for line in original.splitlines() if line.strip().startswith("#"))
+            if comments:
+                notes.append(
+                    f"{new_name!r} loses {comments} comment line(s): fleetctl rewrites "
+                    "target files from the record, and the previous config is kept "
+                    "one generation in `.prev`"
+                )
+
+            replacement = replace(target, name=new_name, role=role, secret_ref=secret_ref)
+            destination = paths.targets_dir / f"{new_name}.toml"
+            if source is not None and source != destination:
+                source.unlink()
+                changes.append(f"targets.d/{source.name} -> targets.d/{destination.name}")
+            write_text_file(
+                destination, target_to_toml(replacement), mode=PRIVATE_FILE_MODE
+            )
+            if role != target.role:
+                changes.append(f"targets.d/{new_name}.toml: role = {role!r} ({_why})")
+
+        # --- protocols and profiles: drop the keys nothing reads ------------
+        for directory, staged_dir, dead in (
+            (live.protocols_dir, paths.protocols_dir, DEPRECATED_PROTOCOL_KEYS),
+            (live.profiles_dir, paths.profiles_dir, DEPRECATED_PROFILE_KEYS),
+        ):
+            if not staged_dir.exists():
+                continue
+            for entry in sorted(staged_dir.glob("*.toml")):
+                text = entry.read_text(encoding="utf-8")
+                stripped, removed = strip_top_level_keys(text, dead)
+                if not removed:
+                    continue
+                write_text_file(entry, stripped, mode=PRIVATE_FILE_MODE)
+                changes.append(
+                    f"{directory.name}/{entry.name}: dropped "
+                    + ", ".join(f"`{key}`" for key in removed)
+                )
+        # --- follow the renames through everything that names a target -----
+        if renames:
+            for pool in context.pools.values():
+                if not any(name in renames for name in pool.targets):
+                    continue
+                updated = replace(
+                    pool,
+                    targets=tuple(renames.get(name, name) for name in pool.targets),
+                )
+                write_text_file(
+                    paths.pools_dir / f"{pool.name}.toml",
+                    pool_to_toml(updated),
+                    mode=PRIVATE_FILE_MODE,
+                )
+                changes.append(f"pools.d/{pool.name}.toml: renamed members")
+            touched_projects = False
+            rebuilt: list[ProjectBinding] = []
+            for binding in context.projects:
+                roots = {
+                    renames.get(name, name): root
+                    for name, root in binding.remote_roots_by_target.items()
+                }
+                default_target = renames.get(
+                    binding.default_target or "", binding.default_target
+                )
+                if (
+                    roots != binding.remote_roots_by_target
+                    or default_target != binding.default_target
+                ):
+                    touched_projects = True
+                rebuilt.append(
+                    replace(
+                        binding,
+                        default_target=default_target,
+                        remote_roots_by_target=roots,
+                    )
+                )
+            if touched_projects:
+                write_text_file(
+                    paths.projects_file,
+                    serialize_projects(rebuilt),
+                    mode=PRIVATE_FILE_MODE,
+                )
+                changes.append("projects.toml: renamed target references")
+
+        # --- validate before anything is swapped ---------------------------
+        try:
+            staged = FleetContext.load(
+                config_home=paths.config_home,
+                state_home=paths.state_home,
+                cache_home=paths.cache_home,
+            )
+        except FleetError as exc:
+            raise FleetError(
+                f"{exc}\n\nthis is a contradiction rather than a stale field, and "
+                "migrate-config will not guess which half you meant: correct the "
+                "protocol, or name the role with `--role NAME=ROLE`. Nothing has "
+                "been changed."
+            ) from exc
+        for target in staged.targets.values():
+            if target.secret_backend != "file" or not target.secret_ref:
+                continue
+            expected = expand_local_path(target.secret_ref)
+            try:
+                relative = expected.relative_to(live.secrets_dir)
+            except ValueError:
+                continue  # points outside the fleet tree; the operator owns it
+            if not (paths.secrets_dir / relative).exists():
+                raise FleetError(
+                    f"migrated target {target.name!r} would reference a secret file "
+                    f"that the new tree does not contain ({expected}); nothing has "
+                    "been changed"
+                )
+
+        for name, new_name, role, why in decisions:
+            label = name if name == new_name else f"{name} -> {new_name}"
+            print(f"{label}\trole={role}\t({why})")
+        for note in notes:
+            print(f"note: {note}", file=sys.stderr)
+
+        if not changes:
+            print("nothing to migrate: every role is declared and no dead keys remain")
+            return 0
+        for change in changes:
+            print(f"change: {change}")
+
+        if args.dry_run:
+            print("dry run: the live config was not touched", file=sys.stderr)
+            return 0
+        previous = swap_config_tree(staging_root, live.config_home)
+    finally:
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+    if previous is not None:
+        print(f"note: previous config kept at {previous}", file=sys.stderr)
     return 0
 
 
@@ -4543,6 +4918,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print a short post-deploy summary after validation",
     )
     deploy_config_parser.set_defaults(handler=command_deploy_config)
+
+    migrate_config_parser = subparsers.add_parser(
+        "migrate-config",
+        help="Rewrite the live fleet config in the schema fleetctl reads today",
+    )
+    migrate_config_parser.add_argument(
+        "--role",
+        action="append",
+        default=[],
+        metavar="TARGET=ROLE",
+        help=(
+            "Set one target's role explicitly instead of letting fleetctl infer it "
+            f"({', '.join(ROLES)}); repeatable"
+        ),
+    )
+    migrate_config_parser.add_argument(
+        "--rename",
+        action="append",
+        default=[],
+        metavar="OLD=NEW",
+        help="Rename a target and follow the name through secrets, pools and "
+        "project bindings; repeatable",
+    )
+    migrate_config_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the migration and validate it, but leave the live config alone",
+    )
+    migrate_config_parser.set_defaults(handler=command_migrate_config)
 
     import_ssh_parser = subparsers.add_parser(
         "import-ssh",
