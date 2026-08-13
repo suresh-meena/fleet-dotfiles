@@ -317,7 +317,7 @@ class FleetContext:
         normalized = self.normalize_selector(selector)
         if normalized:
             if normalized in self.targets:
-                return self.targets[normalized], binding
+                return ensure_target_enabled(self.targets[normalized]), binding
             if normalized in self.pools:
                 return self.select_pool(self.pools[normalized]), binding
             raise FleetError(
@@ -330,7 +330,7 @@ class FleetContext:
                     f"project binding for {binding.path} refers to missing target "
                     f"{binding.default_target!r}"
                 )
-            return self.targets[binding.default_target], binding
+            return ensure_target_enabled(self.targets[binding.default_target]), binding
         if binding and binding.default_pool:
             if binding.default_pool not in self.pools:
                 raise FleetError(
@@ -851,6 +851,128 @@ def resolve_remote_root(
     return target.workdir
 
 
+CONTROL_COMMAND_TIMEOUT = 60.0
+SUBMIT_COMMAND_TIMEOUT = 120.0
+
+SUBMIT_RESOURCE_FLAGS = (
+    ("queue", "--queue"),
+    ("gpus", "--gpus"),
+    ("time", "--time"),
+    ("mem", "--mem"),
+    ("cpus_per_task", "--cpus-per-task"),
+)
+
+
+def ensure_no_resource_flags(args: argparse.Namespace, *, because: str) -> None:
+    """Refuse resource flags on a submit path that cannot honour them."""
+    supplied = [
+        flag
+        for attr, flag in SUBMIT_RESOURCE_FLAGS
+        if getattr(args, attr, None) not in (None, "")
+    ]
+    if supplied:
+        raise FleetError(
+            f"{', '.join(supplied)} cannot be applied here: {because}"
+        )
+
+
+def ensure_job_id_pattern(profile: ProfileRecord) -> None:
+    """Catch a profile that could never report a job id, before anything is submitted."""
+    if not profile.job_id_pattern:
+        raise FleetError(
+            f"profile {profile.name!r} defines `submit_command` but no "
+            "`job_id_pattern`, so a submitted job's id could never be reported back. "
+            f"Add `job_id_pattern` to profiles.d/{profile.name}.toml"
+        )
+
+
+def report_submitted_job(
+    completed: subprocess.CompletedProcess[str],
+    profile: ProfileRecord,
+    *,
+    output_path: str | None = None,
+    error_path: str | None = None,
+) -> int:
+    """Echo scheduler output and report the job id without ever losing a queued job.
+
+    Once the scheduler accepts the script the job exists, so nothing here may raise:
+    a traceback at this point would orphan a real allocation whose only identifier
+    was in output we had not printed yet.
+    """
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    if completed.returncode != 0:
+        return completed.returncode
+
+    match = (
+        re.search(profile.job_id_pattern, completed.stdout)
+        if profile.job_id_pattern
+        else None
+    )
+    if match is None:
+        print(
+            "warning: the scheduler accepted the script but its job id could not be "
+            f"parsed (job_id_pattern={profile.job_id_pattern!r}). The job IS most "
+            "likely queued: read the scheduler output above and confirm with "
+            "`squeue --me` before submitting again.",
+            file=sys.stderr,
+        )
+        return completed.returncode
+
+    job_id = match.groupdict().get("job_id")
+    if not job_id:
+        job_id = match.group(1) if match.groups() else match.group(0)
+    print(f"job_id={job_id}")
+    if output_path:
+        print(f"log_out={output_path.replace('%j', job_id)}")
+    if error_path:
+        print(f"log_err={error_path.replace('%j', job_id)}")
+    return completed.returncode
+
+
+def ensure_target_enabled(target: TargetRecord) -> TargetRecord:
+    """Refuse to act on a target the operator has explicitly disabled."""
+    if not target.enabled:
+        raise FleetError(
+            f"target {target.name!r} is disabled (`enabled = false`); re-enable it in "
+            f"~/.config/fleet/targets.d/{target.name}.toml if it is back in service"
+        )
+    return target
+
+
+UNSAFE_SYNC_DELETE_ROOTS = frozenset({"", ".", "..", "~", "/", "*", "$HOME"})
+
+
+def ensure_sync_delete_allowed(
+    remote_path: str,
+    target: TargetRecord,
+    *,
+    direction: str,
+    force: bool,
+) -> None:
+    """Refuse `--delete` where a mistake would erase a whole home directory."""
+    normalized = remote_path.rstrip("/")
+    if normalized in UNSAFE_SYNC_DELETE_ROOTS:
+        raise FleetError(
+            f"refusing `--delete` against remote path {remote_path!r} on "
+            f"{target.name!r}: that is a home directory, not a project directory"
+        )
+    if target.workdir and normalized == target.workdir.rstrip("/") and not force:
+        raise FleetError(
+            f"refusing `--delete` against the host-level workdir {target.workdir!r} "
+            f"on {target.name!r}; sync a project path instead, or pass --force if you "
+            "really mean the entire workdir"
+        )
+    if direction == "pull" and not force:
+        raise FleetError(
+            "`sync pull --delete` removes local files that are missing on the remote, "
+            "including everything `sync push` refused to upload (.git/, .venv/, .env, "
+            "artifacts/); re-run with --force if that is what you want"
+        )
+
+
 def ensure_private_dir(path: Path, *, mode: int) -> None:
     """Create PATH and enforce private directory permissions."""
     path.mkdir(parents=True, exist_ok=True)
@@ -1137,8 +1259,9 @@ def run_command(
     *,
     env: dict[str, str] | None = None,
     capture_output: bool = False,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one local command with optional capture."""
+    """Run one local command with optional capture and an optional deadline."""
     try:
         return subprocess.run(
             command,
@@ -1146,9 +1269,15 @@ def run_command(
             env=env,
             capture_output=capture_output,
             text=True,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise FleetError(f"missing required command: {command[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise FleetError(
+            f"{command[0]} timed out after {timeout:g}s; the remote host may be "
+            "unreachable or hung"
+        ) from exc
 
 
 def run_ssh_command(
@@ -1161,6 +1290,7 @@ def run_ssh_command(
     control_path: str | None = None,
     strict_host_key_checking: str | None = None,
     update_host_keys: bool = True,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one ssh command with fleet defaults."""
     command = build_ssh_command(
@@ -1172,7 +1302,12 @@ def run_ssh_command(
         strict_host_key_checking=strict_host_key_checking,
         update_host_keys=update_host_keys,
     )
-    return run_command(command, env=ssh_env(secret), capture_output=capture_output)
+    return run_command(
+        command,
+        env=ssh_env(secret),
+        capture_output=capture_output,
+        timeout=timeout,
+    )
 
 
 def render_template_values(
@@ -1201,7 +1336,7 @@ def remote_shell_command(command: list[str], *, cwd: str | None = None) -> str:
         quoted_cwd = shlex.quote(cwd)
         inner = (
             f"if [ -d {quoted_cwd} ]; then cd {quoted_cwd};"
-            f" else printf '%s\\n' 'error: remote cwd not found: {cwd}' >&2;"
+            f" else printf 'error: remote cwd not found: %s\\n' {quoted_cwd} >&2;"
             " exit 1; fi;"
             f" {inner}"
         )
@@ -2872,11 +3007,21 @@ def command_sync(args: argparse.Namespace) -> int:
     target, binding = context.resolve_target(args.selector, cwd=Path.cwd())
     secret = context.resolve_secret(target)
     ssh_runtime = ssh_runtime_kwargs(context)
-    default_remote = (
-        args.remote_path
-        or resolve_remote_root(target, binding)
-        or "."
-    )
+    default_remote = args.remote_path or resolve_remote_root(target, binding)
+    if not default_remote:
+        raise FleetError(
+            f"no remote path for {target.name!r}: the target defines no `workdir` and "
+            "the current directory has no project binding. Pass an explicit remote "
+            "path, set `workdir` on the target, or run `fleetctl project bind`."
+        )
+    if args.delete:
+        ensure_sync_delete_allowed(
+            default_remote,
+            target,
+            direction=args.direction,
+            force=bool(args.force),
+        )
+
     excludes = list(DEFAULT_SYNC_EXCLUDES)
     if binding is not None:
         excludes.extend(binding.sync_excludes)
@@ -2884,10 +3029,10 @@ def command_sync(args: argparse.Namespace) -> int:
     command = ["rsync", "-az"]
     if args.delete:
         command.append("--delete")
+    for pattern in excludes:
+        command += ["--exclude", pattern]
     if args.direction == "push":
         remote_parent = posixpath.dirname(default_remote.rstrip("/")) or "."
-        for pattern in excludes:
-            command += ["--exclude", pattern]
         mkdir = run_ssh_command(
             secret,
             allocate_tty=False,
@@ -2936,6 +3081,13 @@ def command_submit(args: argparse.Namespace) -> int:
     if profile.kind == "direct":
         if args.native_batch:
             raise FleetError("`--native-batch` only applies to scheduler profiles")
+        ensure_no_resource_flags(
+            args,
+            because=(
+                f"profile {profile.name!r} runs the script directly over SSH on "
+                f"{target.name!r}; there is no scheduler to allocate resources"
+            ),
+        )
         namespace = argparse.Namespace(
             config_home=args.config_home,
             state_home=args.state_home,
@@ -2956,6 +3108,14 @@ def command_submit(args: argparse.Namespace) -> int:
             raise FleetError(
                 "`fleetctl submit --native-batch` does not accept extra script arguments"
             )
+        ensure_no_resource_flags(
+            args,
+            because=(
+                "`--native-batch` submits your script unchanged, so its own #SBATCH "
+                "directives decide resources; edit the script instead"
+            ),
+        )
+        ensure_job_id_pattern(profile)
         remote_script = stage_remote_script(
             secret,
             profile,
@@ -2976,20 +3136,10 @@ def command_submit(args: argparse.Namespace) -> int:
             allocate_tty=False,
             remote_command=remote_shell_command(submit_argv, cwd=cwd),
             capture_output=True,
+            timeout=SUBMIT_COMMAND_TIMEOUT,
             **ssh_runtime,
         )
-        if completed.stdout:
-            print(completed.stdout, end="")
-        if completed.stderr:
-            print(completed.stderr, end="", file=sys.stderr)
-        if completed.returncode != 0:
-            return completed.returncode
-        if profile.job_id_pattern:
-            match = re.search(profile.job_id_pattern, completed.stdout)
-            if match:
-                job_id = match.groupdict().get("job_id") or match.group(1)
-                print(f"job_id={job_id}")
-        return completed.returncode
+        return report_submitted_job(completed, profile)
 
     if protocol.kind == "slurm":
         if protocol.native_batch_required:
@@ -2997,6 +3147,7 @@ def command_submit(args: argparse.Namespace) -> int:
                 f"protocol {protocol.name!r} requires `fleetctl submit --native-batch` "
                 "so the scheduler receives the site-native batch script unchanged"
             )
+        ensure_job_id_pattern(profile)
         queue = resolve_queue(protocol, args.queue)
         remote_script = stage_remote_script(
             secret,
@@ -3056,25 +3207,25 @@ def command_submit(args: argparse.Namespace) -> int:
             allocate_tty=False,
             remote_command=remote_shell_command(submit_argv, cwd=cwd),
             capture_output=True,
+            timeout=SUBMIT_COMMAND_TIMEOUT,
             **ssh_runtime,
         )
-        if completed.stdout:
-            print(completed.stdout, end="")
-        if completed.stderr:
-            print(completed.stderr, end="", file=sys.stderr)
-        if completed.returncode != 0:
-            return completed.returncode
-        if profile.job_id_pattern:
-            match = re.search(profile.job_id_pattern, completed.stdout)
-            if match:
-                job_id = match.groupdict().get("job_id") or match.group(1)
-                print(f"job_id={job_id}")
-                if output_path:
-                    print(f"log_out={output_path.replace('%j', job_id)}")
-                if error_path:
-                    print(f"log_err={error_path.replace('%j', job_id)}")
-        return completed.returncode
+        return report_submitted_job(
+            completed,
+            profile,
+            output_path=output_path,
+            error_path=error_path,
+        )
 
+    ensure_no_resource_flags(
+        args,
+        because=(
+            f"protocol {protocol.name!r} has kind={protocol.kind!r}, for which fleetctl "
+            f"renders no batch wrapper; profile {profile.name!r} submits your script "
+            "unchanged, so put the scheduler directives in the script itself"
+        ),
+    )
+    ensure_job_id_pattern(profile)
     remote_script = stage_remote_script(
         secret,
         profile,
@@ -3095,20 +3246,10 @@ def command_submit(args: argparse.Namespace) -> int:
         allocate_tty=False,
         remote_command=remote_shell_command(submit_argv, cwd=cwd),
         capture_output=True,
+        timeout=SUBMIT_COMMAND_TIMEOUT,
         **ssh_runtime,
     )
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    if completed.returncode != 0:
-        return completed.returncode
-    if profile.job_id_pattern:
-        match = re.search(profile.job_id_pattern, completed.stdout)
-        if match:
-            job_id = match.groupdict().get("job_id") or match.group(1)
-            print(job_id)
-    return completed.returncode
+    return report_submitted_job(completed, profile)
 
 
 def run_job_command(
@@ -3609,7 +3750,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote source or destination path (defaults to target/project root)",
     )
     sync_parser.add_argument("--target", dest="selector", help="Target or pool name")
-    sync_parser.add_argument("--delete", action="store_true", help="Pass --delete")
+    sync_parser.add_argument(
+        "--delete",
+        action="store_true",
+        help="Pass --delete to rsync (destructive; guarded)",
+    )
+    sync_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Override a --delete safety refusal",
+    )
     sync_parser.set_defaults(handler=command_sync)
 
     submit_parser = subparsers.add_parser(
