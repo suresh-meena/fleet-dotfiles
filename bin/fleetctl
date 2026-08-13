@@ -1009,6 +1009,32 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
     return protocols
 
 
+def validate_job_id_pattern(
+    pattern: str | None,
+    *,
+    what: str,
+    source: Path | None = None,
+) -> str | None:
+    """Compile a profile's job-id regex now rather than after a job is queued.
+
+    The pattern is only applied to scheduler output, which happens *after*
+    `sbatch` has already accepted the job.  An invalid regex there raises
+    `re.error` at the one moment a traceback is unrecoverable: the allocation is
+    running and its ID has just been discarded.  Compiling at load time makes
+    that state unreachable.
+    """
+    if pattern is None:
+        return None
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        where = f" in {source}" if source is not None else ""
+        raise FleetError(
+            f"invalid `job_id_pattern` for {what}{where}: {exc}"
+        ) from exc
+    return pattern
+
+
 def load_profiles(path: Path) -> dict[str, ProfileRecord]:
     """Load execution profile files."""
     profiles: dict[str, ProfileRecord] = {}
@@ -1055,7 +1081,9 @@ def load_profiles(path: Path) -> dict[str, ProfileRecord]:
             status_command=status,
             cancel_command=cancel,
             logs_command=logs,
-            job_id_pattern=optional_str(raw.get("job_id_pattern")),
+            job_id_pattern=validate_job_id_pattern(
+                optional_str(raw.get("job_id_pattern")), what=what, source=source
+            ),
         )
     if "plain-ssh" not in profiles:
         profiles["plain-ssh"] = ProfileRecord(name="plain-ssh")
