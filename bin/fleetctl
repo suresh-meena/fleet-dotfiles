@@ -85,6 +85,14 @@ ROLE_MATRIX: dict[str, tuple[str, ...]] = {
     "storage":     (ALLOW, ADMIN, DENY,  ALLOW, DENY,  DENY),
 }
 
+# How each decision reads in `fleetctl explain`, where a refusal is information
+# rather than an error.
+DECISION_LABELS = {
+    ALLOW: "allowed",
+    ADMIN: "needs --admin",
+    DENY: "refused",
+}
+
 # Why a verb is refused outright, so the error names the alternative instead of
 # just restating the rule.
 DENY_REASON = {
@@ -654,6 +662,15 @@ class Plan:
     def ssh_runtime(self) -> dict[str, Any]:
         """Return the fleet-managed SSH settings for this plan."""
         return ssh_runtime_kwargs(self.context)
+
+    def ssh_connect_argv(self) -> list[str]:
+        """The ssh invocation this plan will use, without the remote command."""
+        return build_ssh_command(
+            self.secret,
+            allocate_tty=False,
+            remote_command=None,
+            **self.ssh_runtime(),
+        )
 
     def describe(self) -> dict[str, Any]:
         """Report the plan as data, for `--dry-run`, `explain` and `--json`."""
@@ -2597,6 +2614,130 @@ def redact_secret(secret: FleetSecret) -> dict[str, Any]:
     }
 
 
+def emit(payload: dict[str, Any], *, as_json: bool) -> None:
+    """Print one command result: JSON when asked, aligned key/value lines otherwise.
+
+    Every command used to carry its own printer, and two of them shipped an
+    `if args.json:` whose branches were character-identical -- so `doctor`
+    emitted JSON whether or not you asked for it.
+    """
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(render_text_payload(payload))
+
+
+def render_text_payload(value: Any, *, indent: int = 0) -> str:
+    """Render nested plain data as readable indented lines."""
+    pad = "  " * indent
+    if isinstance(value, dict):
+        if not value:
+            return f"{pad}(none)"
+        width = max(len(str(key)) for key in value)
+        lines: list[str] = []
+        for key, item in value.items():
+            label = f"{pad}{str(key).ljust(width)}"
+            if isinstance(item, (dict, list, tuple)) and item:
+                lines.append(f"{label} :")
+                lines.append(render_text_payload(item, indent=indent + 1))
+            else:
+                lines.append(f"{label} : {render_scalar(item)}")
+        return "\n".join(lines)
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return f"{pad}(none)"
+        return "\n".join(
+            render_text_payload(item, indent=indent)
+            if isinstance(item, (dict, list, tuple))
+            else f"{pad}- {render_scalar(item)}"
+            for item in value
+        )
+    return f"{pad}{render_scalar(value)}"
+
+
+def render_scalar(value: Any) -> str:
+    """Render one leaf value for human output."""
+    if value is None:
+        return "-"
+    if isinstance(value, (dict, list, tuple)) and not value:
+        return "(none)"
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return str(value)
+
+
+def planned_script_path(profile: ProfileRecord, local_script: Path) -> str:
+    """Return the shape of the path a script would be staged to, without staging it.
+
+    The real token is drawn per run and a relative `remote_script_root` needs the
+    remote home resolved, so a dry run shows the shape rather than pretending to
+    know the exact path.  Nothing else about the command depends on it.
+    """
+    root = profile.remote_script_root
+    if not root.startswith(("/", "~/", "$HOME")):
+        # What the real staging does, minus the round trip that resolves $HOME.
+        root = f"$HOME/{root}"
+    return remote_posix_join(remote_posix_join(root, "<token>"), local_script.name)
+
+
+def report_plan(
+    plan: Plan,
+    args: argparse.Namespace,
+    extra: dict[str, Any] | None = None,
+    *,
+    block: tuple[str, str] | None = None,
+) -> int:
+    """Print the resolved plan and do nothing else.
+
+    Ansible's honesty rule: this simulates local resolution and claims nothing
+    about remote state.  `sync` is the one verb where a dry run can be
+    remote-accurate, and it runs `rsync --dry-run` itself to earn that.
+    """
+    payload = plan.describe()
+    payload["ssh"] = shlex.join(plan.ssh_connect_argv())
+    payload.update(extra or {})
+    as_json = bool(getattr(args, "json", False))
+    if block is not None and as_json:
+        payload[block[0]] = block[1]
+    emit(payload, as_json=as_json)
+    if block is not None and not as_json:
+        print(f"\n--- {block[0]} ---")
+        print(block[1].rstrip("\n"))
+    return 0
+
+
+def report_script_plan(
+    plan: Plan,
+    args: argparse.Namespace,
+    local_script: Path,
+    *,
+    interpreter: str | None,
+    script_args: list[str],
+) -> int:
+    """Describe the script run PLAN would perform."""
+    chosen = interpreter or plan.profile.interpreter
+    staged = planned_script_path(plan.profile, local_script)
+    argv: list[str] = []
+    if chosen:
+        argv.extend(shlex.split(chosen))
+    argv.append(staged)
+    argv.extend(script_args)
+    return report_plan(
+        plan,
+        args,
+        {
+            "local_script": str(local_script),
+            "staged_as": staged,
+            "interpreter": chosen,
+            "remote_command": shlex.join(
+                prefixed_env_command(argv, plan.profile.environment)
+            ),
+        },
+    )
+
+
 def format_table(rows: list[dict[str, Any]], columns: list[str]) -> str:
     """Render a tiny fixed-width table."""
     def cell(value: Any) -> str:
@@ -4172,6 +4313,12 @@ def command_exec(args: argparse.Namespace, context: FleetContext) -> int:
         )
     plan = build_plan(context, args, "exec")
     environment = dict(plan.profile.environment)
+    if args.dry_run:
+        return report_plan(
+            plan,
+            args,
+            {"remote_command": shlex.join(argv), "environment": environment or None},
+        )
     encoded_stub = base64.b64encode(EXEC_REMOTE_STUB.encode("utf-8")).decode("ascii")
     payload = base64.b64encode(
         json.dumps(
@@ -4232,8 +4379,17 @@ def command_script(args: argparse.Namespace, context: FleetContext) -> int:
     local_script = Path(args.local_script).expanduser().resolve()
     if not local_script.is_file():
         raise FleetError(f"missing local script: {local_script}")
+    plan = build_plan(context, args, "script")
+    if args.dry_run:
+        return report_script_plan(
+            plan,
+            args,
+            local_script,
+            interpreter=args.interpreter,
+            script_args=args.script_args,
+        )
     return run_script_plan(
-        build_plan(context, args, "script"),
+        plan,
         local_script,
         interpreter=args.interpreter,
         script_args=args.script_args,
@@ -4275,7 +4431,7 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
         command.append("--delete")
     for pattern in excludes:
         command += ["--exclude", pattern]
-    if args.direction == "push":
+    if args.direction == "push" and not args.dry_run:
         remote_parent = posixpath.dirname(default_remote.rstrip("/")) or "."
         mkdir = run_ssh_command(
             secret,
@@ -4304,6 +4460,27 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
         # deeper.  This also makes `--delete` mean the same thing both ways.
         remote = f"{secret.target}:{default_remote.rstrip('/')}/"
         command += [remote, local]
+
+    if args.dry_run:
+        # The one verb where a dry run is remote-accurate rather than a local
+        # simulation: rsync itself reports exactly what it would transfer.
+        command[1:1] = ["--dry-run", "--itemize-changes"]
+        report_plan(
+            plan,
+            args,
+            {
+                "direction": args.direction,
+                "local_path": local,
+                "remote_path": default_remote,
+                "delete": bool(args.delete),
+                "excludes": excludes,
+                "rsync": shlex.join(command),
+            },
+        )
+        print("\n--- rsync --itemize-changes ---")
+        # rsync writes straight to the terminal, so the plan above has to be on
+        # its way out before it starts, or a piped run interleaves them.
+        sys.stdout.flush()
 
     completed = run_command(command, env=ssh_env(secret))
     return completed.returncode
@@ -4338,6 +4515,14 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
                 f"{target.name!r}; there is no scheduler to allocate resources"
             ),
         )
+        if args.dry_run:
+            return report_script_plan(
+                plan,
+                args,
+                local_script,
+                interpreter=args.interpreter,
+                script_args=args.script_args,
+            )
         return run_script_plan(
             plan,
             local_script,
@@ -4359,6 +4544,17 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
             ),
         )
         ensure_job_id_pattern(profile)
+        if args.dry_run:
+            return report_plan(
+                plan,
+                args,
+                {
+                    "local_script": str(local_script),
+                    "staged_as": planned_script_path(profile, local_script),
+                    "native_batch": True,
+                    "submit_command": shlex.join(profile.submit_command),
+                },
+            )
         remote_script = stage_remote_script(
             secret,
             profile,
@@ -4380,11 +4576,15 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
         )
     ensure_job_id_pattern(profile)
     queue = resolve_queue(protocol, args.queue)
-    remote_script = stage_remote_script(
-        secret,
-        profile,
-        local_script,
-        ssh_runtime=ssh_runtime,
+    remote_script = (
+        planned_script_path(profile, local_script)
+        if args.dry_run
+        else stage_remote_script(
+            secret,
+            profile,
+            local_script,
+            ssh_runtime=ssh_runtime,
+        )
     )
     job_base_root = protocol_base_root(target, plan.binding, args.cwd)
     output_dir, output_path, error_path = resolve_job_output_paths(
@@ -4393,7 +4593,7 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
         output_override=args.output,
         error_override=args.error,
     )
-    if output_dir:
+    if output_dir and not args.dry_run:
         ensure_remote_directory(secret, output_dir, ssh_runtime=ssh_runtime)
     job_name = sanitize_job_name(args.job_name or local_script.stem)
     wrapper_text = render_slurm_wrapper(
@@ -4412,6 +4612,24 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
         output_path=output_path,
         error_path=error_path,
     )
+    if args.dry_run:
+        # The whole point of a submit dry run: read the wrapper the scheduler
+        # would receive, before it receives it.
+        return report_plan(
+            plan,
+            args,
+            {
+                "local_script": str(local_script),
+                "staged_as": remote_script,
+                "queue": queue.name,
+                "partition": queue.partition,
+                "job_name": job_name,
+                "output_path": output_path,
+                "error_path": error_path,
+                "submit_command": shlex.join(profile.submit_command),
+            },
+            block=("rendered batch script", wrapper_text),
+        )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
         handle.write(wrapper_text)
         wrapper_local = Path(handle.name)
@@ -4477,6 +4695,23 @@ def command_job_logs(args: argparse.Namespace, context: FleetContext) -> int:
 def command_job_cancel(args: argparse.Namespace, context: FleetContext) -> int:
     """Cancel one remote scheduler job."""
     plan = build_plan(context, args, "job")
+    if args.dry_run:
+        return report_plan(
+            plan,
+            args,
+            {
+                "job_id": args.job_id,
+                "remote_command": shlex.join(
+                    render_template_values(
+                        plan.profile.cancel_command,
+                        job_id=args.job_id,
+                        workdir=plan.cwd,
+                    )
+                )
+                if plan.profile.cancel_command
+                else None,
+            },
+        )
     return run_job_command(plan, plan.profile.cancel_command, job_id=args.job_id)
 
 
@@ -4554,6 +4789,41 @@ def probe_remote_prerequisites(context: FleetContext) -> list[str]:
                 "runs its payload through a remote Python stub and will fail there"
             )
     return problems
+
+
+def command_explain(args: argparse.Namespace, context: FleetContext) -> int:
+    """Explain what a selector resolves to, and what each verb may do there.
+
+    Deliberately does not call authorize(): here a refusal is the answer, not an
+    error, so `explain` can tell you that `exec` needs --admin without making you
+    pass --admin to find out.  Everything else is the same resolution the verbs
+    use, so this is also the debugging story for "why did it pick that?".
+    """
+    selector = context.normalize_selector(args.selector)
+    target, binding = context.resolve_target(selector, cwd=Path.cwd())
+    protocol = context.resolve_protocol(target)
+    plan = Plan(
+        verb=args.verb or "explain",
+        context=context,
+        target=target,
+        binding=binding,
+        protocol=protocol,
+        profile=context.resolve_profile(target, binding, args.profile),
+        cwd=resolve_remote_root(target, binding, args.cwd),
+        selector=selector,
+        pool=context.pools.get(selector) if selector else None,
+        admin=bool(args.admin),
+    )
+    role = resolve_role(target, protocol)
+    payload = plan.describe()
+    payload["ssh"] = shlex.join(plan.ssh_connect_argv())
+    payload["queues"] = [queue.name for queue in protocol.queues]
+    payload["admission"] = {
+        verb: DECISION_LABELS[ROLE_MATRIX[role][VERBS.index(verb)]]
+        for verb in (VERBS if args.verb is None else (args.verb,))
+    }
+    emit(payload, as_json=bool(args.json))
+    return 0
 
 
 def command_doctor(args: argparse.Namespace) -> int:
@@ -5086,6 +5356,11 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="Command to run remotely, introduced by `--`",
     )
+    exec_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and print the plan without touching the target",
+    )
     exec_parser.set_defaults(handler=command_exec)
 
     script_parser = subparsers.add_parser(
@@ -5107,6 +5382,11 @@ def build_parser() -> argparse.ArgumentParser:
         "script_args",
         nargs="*",
         help="Arguments passed to the uploaded script after `--`",
+    )
+    script_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and print the plan without touching the target",
     )
     script_parser.set_defaults(handler=command_script)
 
@@ -5133,6 +5413,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--admin",
         action="store_true",
         help="Acknowledge a control-plane action on a role that repels this verb",
+    )
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and print the plan without touching the target",
     )
     sync_parser.set_defaults(handler=command_sync)
 
@@ -5182,6 +5467,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Acknowledge a control-plane action on a role that repels this verb",
     )
+    submit_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and print the plan without touching the target",
+    )
     submit_parser.set_defaults(handler=command_submit)
 
     job_parser = subparsers.add_parser("job", help="Inspect or manage remote jobs")
@@ -5221,7 +5511,33 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Acknowledge a control-plane action on a role that repels this verb",
     )
+    cancel_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and print the plan without touching the target",
+    )
     cancel_parser.set_defaults(handler=command_job_cancel)
+
+    explain_parser = subparsers.add_parser(
+        "explain",
+        help="Show what a selector resolves to and which verbs it admits",
+    )
+    explain_parser.add_argument("selector", nargs="?", help="Target or pool name")
+    explain_parser.add_argument(
+        "verb",
+        nargs="?",
+        choices=VERBS,
+        help="Report admission for one verb instead of all of them",
+    )
+    explain_parser.add_argument("--profile", help="Execution profile override")
+    explain_parser.add_argument("--cwd", help="Remote working directory override")
+    explain_parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Show the plan as it would resolve with --admin",
+    )
+    explain_parser.add_argument("--json", action="store_true", help="Emit JSON")
+    explain_parser.set_defaults(handler=command_explain)
 
     doctor_parser = subparsers.add_parser("doctor", help="Validate local fleet setup")
     doctor_parser.add_argument("--json", action="store_true", help="Emit JSON")
