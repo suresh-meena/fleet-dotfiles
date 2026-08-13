@@ -3937,6 +3937,44 @@ def toml_syntax_problems(paths: FleetPaths) -> list[str]:
     return problems
 
 
+def probe_remote_prerequisites(context: FleetContext) -> list[str]:
+    """Check the one remote prerequisite fleetctl silently assumes: python3.
+
+    `exec` ships its payload through a remote Python stub, while `ssh`, `script`
+    and `smoke` all work without it -- so a host missing python3 looks healthy
+    right up to the first `fleetctl exec`.  This needs the network, so it is
+    opt-in: an unreachable host is not a configuration fault, and plain `doctor`
+    stays offline and instant.
+    """
+    problems: list[str] = []
+    runtime = ssh_runtime_kwargs(context)
+    for target in sorted(context.targets.values(), key=lambda item: item.name):
+        if not target.enabled:
+            continue
+        try:
+            secret = context.resolve_secret(target)
+        except FleetError:
+            continue  # already reported by the offline pass
+        try:
+            completed = run_ssh_command(
+                secret,
+                allocate_tty=False,
+                remote_command="command -v python3",
+                capture_output=True,
+                timeout=CONTROL_COMMAND_TIMEOUT,
+                **runtime,
+            )
+        except FleetError as exc:
+            problems.append(f"target {target.name!r} is not reachable: {exc}")
+            continue
+        if completed.returncode != 0:
+            problems.append(
+                f"target {target.name!r} has no `python3` on PATH; `fleetctl exec` "
+                "runs its payload through a remote Python stub and will fail there"
+            )
+    return problems
+
+
 def command_doctor(args: argparse.Namespace) -> int:
     """Validate local prerequisites and private file permissions.
 
@@ -4000,17 +4038,34 @@ def command_doctor(args: argparse.Namespace) -> int:
         context = None
 
     if context is not None:
+        referenced_secrets: set[Path] = set()
         for target in context.targets.values():
             try:
                 protocol = context.resolve_protocol(target)
             except FleetError as exc:
                 problems.append(str(exc))
                 continue
+            # Every name a target points at must resolve, not just its protocol.
+            # A target naming a profile that does not exist used to pass doctor
+            # and fail at the moment you tried to use it.
+            try:
+                profile = context.resolve_profile(target, None, None)
+            except FleetError as exc:
+                problems.append(f"target {target.name!r}: {exc}")
+                profile = None
+            if profile is not None and protocol.kind == "slurm" and not profile.submit_command:
+                problems.append(
+                    f"target {target.name!r} resolves to profile {profile.name!r}, "
+                    f"which has no `submit_command`, but protocol {protocol.name!r} "
+                    "is scheduler-backed: `fleetctl submit` cannot work here"
+                )
             try:
                 secret = context.resolve_secret(target)
             except FleetError as exc:
                 problems.append(str(exc))
                 continue
+            if target.secret_backend == "file" and target.secret_ref:
+                referenced_secrets.add(expand_local_path(target.secret_ref).resolve())
             if target.secret_backend == "file" and target.secret_ref:
                 secret_path = expand_local_path(target.secret_ref)
                 if secret_path.exists():
@@ -4030,13 +4085,61 @@ def command_doctor(args: argparse.Namespace) -> int:
                     "without any queue presets"
                 )
 
+        # A pool that cannot be selected from is a pool that aborts the first
+        # command aimed at it.  `select_pool` is the only definition of pool
+        # membership, so run the real thing rather than re-deriving it.
+        for pool in context.pools.values():
+            try:
+                context.select_pool(pool)
+            except FleetError as exc:
+                problems.append(str(exc))
+            for name in pool.targets:
+                target = context.targets.get(name)
+                if target is not None and not target.enabled:
+                    warnings.append(
+                        f"pool {pool.name!r} lists disabled target {name!r}"
+                    )
+
         for binding in context.projects:
+            # `default_target` and `default_pool` are exactly the fields that
+            # abort `resolve_target`, and were the two doctor did not check.
+            if binding.default_target and binding.default_target not in context.targets:
+                problems.append(
+                    f"project binding {binding.path} names unknown default target "
+                    f"{binding.default_target!r}"
+                )
+            if binding.default_pool and binding.default_pool not in context.pools:
+                problems.append(
+                    f"project binding {binding.path} names unknown default pool "
+                    f"{binding.default_pool!r}"
+                )
+            if binding.default_profile and binding.default_profile not in context.profiles:
+                problems.append(
+                    f"project binding {binding.path} names unknown default profile "
+                    f"{binding.default_profile!r}"
+                )
+            if not binding.path.exists():
+                warnings.append(
+                    f"project binding points at a missing directory: {binding.path}"
+                )
             for target_name in sorted(binding.remote_roots_by_target):
                 if target_name not in context.targets:
                     warnings.append(
                         f"project binding {binding.path} defines a landing strip for "
                         f"unknown target {target_name!r}"
                     )
+
+        # A secret file no target references is usually the leftover of a rename:
+        # live credentials for a host nothing in the fleet points at any more.
+        if paths.secrets_dir.is_dir():
+            for orphan in sorted(paths.secrets_dir.glob("*.toml")):
+                if orphan.resolve() not in referenced_secrets:
+                    warnings.append(
+                        f"secret file is not referenced by any target: {orphan}"
+                    )
+
+        if getattr(args, "probe", False):
+            problems.extend(probe_remote_prerequisites(context))
 
     payload = {
         "config_home": str(paths.config_home),
@@ -4470,6 +4573,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = subparsers.add_parser("doctor", help="Validate local fleet setup")
     doctor_parser.add_argument("--json", action="store_true", help="Emit JSON")
+    doctor_parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="Also connect to every enabled target and check remote prerequisites",
+    )
     doctor_parser.set_defaults(handler=command_doctor)
 
     return parser
