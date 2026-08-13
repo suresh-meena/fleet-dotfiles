@@ -1351,6 +1351,9 @@ def run_ssh_command(
     )
 
 
+TEMPLATE_PLACEHOLDER = re.compile(r"\{(script|job_id|workdir)\}")
+
+
 def render_template_values(
     values: Iterable[str],
     *,
@@ -1358,16 +1361,21 @@ def render_template_values(
     job_id: str | None = None,
     workdir: str | None = None,
 ) -> list[str]:
-    """Render simple `{name}` placeholders in argv templates."""
-    rendered: list[str] = []
+    """Render `{script}`, `{job_id}` and `{workdir}` placeholders in argv templates.
+
+    Deliberately not `str.format`: these templates come from config, and a literal
+    brace -- an awk program, a `${VAR}`, a JSON fragment -- raised at render time,
+    while an unrecognised `{name}` raised KeyError instead of being left alone.
+    """
     substitutions = {
         "script": script_path or "",
         "job_id": job_id or "",
         "workdir": workdir or "",
     }
-    for value in values:
-        rendered.append(value.format(**substitutions))
-    return rendered
+    return [
+        TEMPLATE_PLACEHOLDER.sub(lambda match: substitutions[match.group(1)], value)
+        for value in values
+    ]
 
 
 def quote_remote_path(path: str) -> str:
