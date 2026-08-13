@@ -1,6 +1,5 @@
 version = 1
 name = "slurm-batch"
-kind = "scheduler"
 job_id_pattern = "Submitted batch job (?P<job_id>\\d+)"
 submit_command = ["sbatch", "{script}"]
 status_command = ["squeue", "--jobs", "{job_id}"]

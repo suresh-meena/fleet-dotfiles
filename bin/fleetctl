@@ -137,6 +137,54 @@ def authorize(
     )
 
 
+def check_role_protocol(target: "TargetRecord", protocol: "ProtocolRecord") -> None:
+    """A role and a protocol must agree about whether compute is scheduled here.
+
+    `role = "login"` with a direct protocol is precisely the fail-open state this
+    section exists to prevent: the matrix would demand --admin for `exec`, and the
+    protocol would then run the job on the login node anyway.  The mirror case is
+    just as wrong -- a workstation pointed at a scheduler protocol makes `submit`
+    call `sbatch` on a box with no scheduler.
+    """
+    if target.role is None:
+        return  # inferred from the protocol, so coherent by construction
+    scheduled = protocol.kind != "direct"
+    if target.role == "login" and not scheduled:
+        raise FleetError(
+            f"target {target.name!r} declares role \"login\" but protocol "
+            f"{protocol.name!r} runs work directly. A login role means compute goes "
+            "through `fleetctl submit`, so point it at the site's scheduler protocol "
+            "or give the machine the role it really has."
+        )
+    if target.role != "login" and scheduled:
+        raise FleetError(
+            f"target {target.name!r} declares role {target.role!r} but protocol "
+            f"{protocol.name!r} is scheduler-backed. Only a login role submits "
+            "through a scheduler."
+        )
+
+
+def check_protocol_profile(
+    target: "TargetRecord",
+    protocol: "ProtocolRecord",
+    profile: "ProfileRecord",
+) -> None:
+    """A profile submits if and only if its protocol has a scheduler to submit to."""
+    submits = bool(profile.submit_command)
+    if protocol.kind != "direct" and not submits:
+        raise FleetError(
+            f"target {target.name!r} resolves to profile {profile.name!r}, which "
+            f"defines no `submit_command`, but protocol {protocol.name!r} is "
+            "scheduler-backed: `fleetctl submit` has nothing to call."
+        )
+    if protocol.kind == "direct" and submits:
+        raise FleetError(
+            f"target {target.name!r} resolves to profile {profile.name!r}, which "
+            f"defines `submit_command`, but protocol {protocol.name!r} runs work "
+            "directly: there is no scheduler on that host to accept the job."
+        )
+
+
 EXEC_REMOTE_STUB = """\
 import base64
 import json
@@ -211,7 +259,6 @@ class TargetRecord:
     secret_inline: dict[str, Any] = field(default_factory=dict)
     ssh_host_alias: str | None = None
     default_profile: str | None = None
-    scheduler: str = "none"
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -231,7 +278,6 @@ class ProfileRecord:
     """Execution behavior for one class of target."""
 
     name: str
-    kind: str = "direct"
     interpreter: str | None = "/usr/bin/env bash"
     remote_script_root: str = DEFAULT_SCRIPT_REMOTE_ROOT
     environment: dict[str, str] = field(default_factory=dict)
@@ -269,8 +315,6 @@ class ProtocolRecord:
     kind: str = "direct"
     description: str | None = None
     default_profile: str | None = None
-    scheduler_required: bool = False
-    allow_login_exec: bool = True
     smoke_gpu_probe: bool = True
     gpu_request_mode: str = "gres"
     job_runtime: str = "host"
@@ -351,6 +395,7 @@ class FleetContext:
         config_home: Path | None = None,
         state_home: Path | None = None,
         cache_home: Path | None = None,
+        strict: bool = True,
     ) -> "FleetContext":
         paths = build_paths(
             config_home=config_home,
@@ -364,7 +409,7 @@ class FleetContext:
         protocols = load_protocols(paths.protocols_dir)
         profiles = load_profiles(paths.profiles_dir)
         projects = load_projects(paths.projects_file)
-        return cls(
+        context = cls(
             paths=paths,
             config=config,
             targets=targets,
@@ -373,6 +418,29 @@ class FleetContext:
             profiles=profiles,
             projects=projects,
         )
+        if strict:
+            problems = context.coherence_problems()
+            if problems:
+                raise FleetError(
+                    "fleet config is incoherent:\n  - " + "\n  - ".join(problems)
+                )
+        return context
+
+    def coherence_problems(self) -> list[str]:
+        """Return every role/protocol/profile disagreement in the inventory.
+
+        All of them, not the first: fixing a config one error per run is why
+        people stop reading errors.  Pure TOML resolution, so this costs nothing
+        and runs on every load.
+        """
+        problems: list[str] = []
+        for target in self.targets.values():
+            try:
+                self.resolve_protocol(target)
+                self.resolve_profile(target, None, None)
+            except FleetError as exc:
+                problems.append(str(exc))
+        return problems
 
     def project_binding_for(self, path: Path | None = None) -> ProjectBinding | None:
         """Return the longest-prefix project binding for PATH or current cwd."""
@@ -480,21 +548,23 @@ class FleetContext:
             raise FleetError(
                 f"profile {chosen!r} is not configured; initialize fleet config first"
             )
-        return self.profiles[chosen]
+        profile = self.profiles[chosen]
+        check_protocol_profile(target, protocol, profile)
+        return profile
 
     def resolve_protocol(self, target: TargetRecord) -> ProtocolRecord:
         """Resolve the behavior protocol for TARGET."""
         chosen = target.protocol
         if chosen is None:
-            if target.scheduler != "none":
-                chosen = "slurm"
-            else:
-                chosen = "direct"
+            raise FleetError(
+                f"target {target.name!r} does not declare `protocol`"
+            )
         protocol = self.protocols.get(chosen)
         if protocol is None:
             raise FleetError(
                 f"target {target.name!r} refers to unknown protocol {chosen!r}"
             )
+        check_role_protocol(target, protocol)
         return protocol
 
     def resolve_secret(self, target: TargetRecord) -> FleetSecret:
@@ -622,7 +692,6 @@ TARGET_KEYS = frozenset(
         "secret",
         "ssh_host_alias",
         "default_profile",
-        "scheduler",
         "metadata",
     }
 )
@@ -636,8 +705,6 @@ PROTOCOL_KEYS = frozenset(
         "kind",
         "description",
         "default_profile",
-        "scheduler_required",
-        "allow_login_exec",
         "smoke_gpu_probe",
         "gpu_request_mode",
         "job_runtime",
@@ -670,7 +737,6 @@ PROFILE_KEYS = frozenset(
     {
         "version",
         "name",
-        "kind",
         "script",
         "environment",
         "submit_command",
@@ -717,13 +783,28 @@ SECRET_KEYS = frozenset(
 
 TRANSPORTS = ("ssh",)
 SECRET_BACKENDS = ("file", "pass", "inline")
-SCHEDULERS = ("none", "slurm")
 POOL_STRATEGIES = ("ordered", "random")
 PROTOCOL_KINDS = ("direct", "slurm")
-PROFILE_KINDS = ("direct", "scheduler")
 GPU_REQUEST_MODES = ("none", "gpus", "gres")
 AUTH_MODES = ("key", "password")
 STRICT_HOST_KEY_MODES = ("yes", "no", "off", "ask", "accept-new")
+
+# Keys that used to mean something and no longer do.  Four fields described one
+# property -- "does compute here go through a scheduler" -- and disagreed with
+# each other; `role` and `submit_command` now answer it once each.  They stay
+# *accepted* so an unmigrated fleet keeps loading, but nothing reads them, and
+# `doctor` names every file still carrying one.  Tolerating a key is a decision,
+# so it is written down here rather than hidden as a stray entry in a key set.
+DEPRECATED_TARGET_KEYS: dict[str, str] = {
+    "scheduler": "what may run here is decided by `role`; `protocol` is required",
+}
+DEPRECATED_PROTOCOL_KEYS: dict[str, str] = {
+    "scheduler_required": "the role matrix decides this for every verb",
+    "allow_login_exec": "the role matrix decides this; pass --admin per command",
+}
+DEPRECATED_PROFILE_KEYS: dict[str, str] = {
+    "kind": "derived from whether the profile defines `submit_command`",
+}
 
 
 def reject_unknown_keys(
@@ -733,10 +814,16 @@ def reject_unknown_keys(
     what: str,
     source: Path | None = None,
     guidance: dict[str, str] | None = None,
+    deprecated: dict[str, str] | None = None,
 ) -> None:
-    """Fail on any key the loader would otherwise ignore."""
+    """Fail on any key the loader would otherwise ignore.
+
+    DEPRECATED keys are accepted and ignored -- never suggested as a correction,
+    because steering a typo towards a dead field is worse than no suggestion.
+    """
     known_keys = sorted(known)
-    unknown = sorted(key for key in raw if key not in set(known_keys))
+    tolerated = set(known_keys) | set(deprecated or ())
+    unknown = sorted(key for key in raw if key not in tolerated)
     if not unknown:
         return
     hints: list[str] = []
@@ -891,7 +978,18 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
             what=what,
             source=source,
             guidance=TARGET_FILE_WARNINGS,
+            deprecated=DEPRECATED_TARGET_KEYS,
         )
+        # fleetctl used to fall back to `scheduler` when `protocol` was absent, so
+        # the obvious way to add a Slurm box -- tags and no protocol -- produced a
+        # direct target you could run training jobs on.  Naming the protocol is one
+        # word and removes the guess entirely.
+        if optional_str(raw.get("protocol")) is None:
+            raise FleetError(
+                f"{what} in {source} does not declare `protocol`. Name `direct` for "
+                "a machine you run work on yourself, or the site's protocol for a "
+                "scheduler surface; fleetctl no longer guesses."
+            )
         target = TargetRecord(
             name=name,
             enabled=bool(raw.get("enabled", True)),
@@ -925,13 +1023,6 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
             ),
             ssh_host_alias=optional_str(raw.get("ssh_host_alias")),
             default_profile=optional_str(raw.get("default_profile")),
-            scheduler=check_vocabulary(
-                str(raw.get("scheduler", "none")),
-                SCHEDULERS,
-                what=what,
-                key="scheduler",
-                source=source,
-            ),
             metadata=check_table(
                 raw.get("metadata", {}), what=f"`metadata` for {what}", source=source
             ),
@@ -981,8 +1072,6 @@ def built_in_protocols() -> dict[str, ProtocolRecord]:
         kind="direct",
         description="Direct SSH execution on a host-level workdir.",
         default_profile="plain-ssh",
-        scheduler_required=False,
-        allow_login_exec=True,
         smoke_gpu_probe=True,
         gpu_request_mode="gres",
         job_runtime="host",
@@ -993,8 +1082,6 @@ def built_in_protocols() -> dict[str, ProtocolRecord]:
         kind="slurm",
         description="Scheduler-backed login surface that submits compute via Slurm.",
         default_profile="slurm-batch",
-        scheduler_required=True,
-        allow_login_exec=False,
         smoke_gpu_probe=False,
         gpu_request_mode="gres",
         job_runtime="host",
@@ -1012,7 +1099,13 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
     for name, raw, source in load_records_from_dir(path, kind="protocol"):
         what = f"protocol {name!r}"
         check_version(raw, what=what, source=source)
-        reject_unknown_keys(raw, PROTOCOL_KEYS, what=what, source=source)
+        reject_unknown_keys(
+            raw,
+            PROTOCOL_KEYS,
+            what=what,
+            source=source,
+            deprecated=DEPRECATED_PROTOCOL_KEYS,
+        )
         queues: list[QueueRecord] = []
         for item in raw.get("queue", []):
             if not isinstance(item, dict):
@@ -1080,10 +1173,6 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
             description=optional_str(raw.get("description")),
             default_profile=optional_str(raw.get("default_profile"))
             or ("slurm-batch" if kind == "slurm" else "plain-ssh"),
-            scheduler_required=bool(
-                raw.get("scheduler_required", kind == "slurm")
-            ),
-            allow_login_exec=bool(raw.get("allow_login_exec", kind != "slurm")),
             smoke_gpu_probe=bool(raw.get("smoke_gpu_probe", kind != "slurm")),
             gpu_request_mode=check_vocabulary(
                 str(raw.get("gpu_request_mode", "gres")),
@@ -1134,7 +1223,13 @@ def load_profiles(path: Path) -> dict[str, ProfileRecord]:
     for name, raw, source in load_records_from_dir(path, kind="profile"):
         what = f"profile {name!r}"
         check_version(raw, what=what, source=source)
-        reject_unknown_keys(raw, PROFILE_KEYS, what=what, source=source)
+        reject_unknown_keys(
+            raw,
+            PROFILE_KEYS,
+            what=what,
+            source=source,
+            deprecated=DEPRECATED_PROFILE_KEYS,
+        )
         submit = tuple(str(item) for item in raw.get("submit_command", []))
         status = tuple(str(item) for item in raw.get("status_command", []))
         cancel = tuple(str(item) for item in raw.get("cancel_command", []))
@@ -1160,13 +1255,6 @@ def load_profiles(path: Path) -> dict[str, ProfileRecord]:
             remote_script_root = DEFAULT_SCRIPT_REMOTE_ROOT
         profiles[name] = ProfileRecord(
             name=name,
-            kind=check_vocabulary(
-                str(raw.get("kind", "direct")),
-                PROFILE_KINDS,
-                what=what,
-                key="kind",
-                source=source,
-            ),
             interpreter=interpreter,
             remote_script_root=remote_script_root,
             environment={str(key): str(value) for key, value in environment.items()},
@@ -1245,6 +1333,27 @@ def target_schema_warnings(path: Path) -> list[str]:
                 warnings.append(
                     f"target file {entry} defines `{field}`; {guidance}"
                 )
+    return warnings
+
+
+def deprecated_key_warnings(paths: FleetPaths) -> list[str]:
+    """Name every config file still carrying a key nothing reads."""
+    warnings: list[str] = []
+    for directory, dead in (
+        (paths.targets_dir, DEPRECATED_TARGET_KEYS),
+        (paths.protocols_dir, DEPRECATED_PROTOCOL_KEYS),
+        (paths.profiles_dir, DEPRECATED_PROFILE_KEYS),
+    ):
+        if not directory.exists():
+            continue
+        for entry in sorted(directory.glob("*.toml")):
+            raw = load_toml_file(entry, default={})
+            for key, why in dead.items():
+                if key in raw:
+                    warnings.append(
+                        f"{entry} still defines `{key}`, which fleetctl ignores: "
+                        f"{why}. Run `fleetctl migrate-config`."
+                    )
     return warnings
 
 
@@ -1402,6 +1511,40 @@ def ensure_job_id_pattern(profile: ProfileRecord) -> None:
             "`job_id_pattern`, so a submitted job's id could never be reported back. "
             f"Add `job_id_pattern` to profiles.d/{profile.name}.toml"
         )
+
+
+def submit_staged_script(
+    secret: "FleetSecret",
+    profile: "ProfileRecord",
+    *,
+    remote_script: str,
+    cwd: str | None,
+    ssh_runtime: dict[str, Any],
+    output_path: str | None = None,
+    error_path: str | None = None,
+) -> int:
+    """Hand one already-staged script to the profile's scheduler."""
+    submit_argv = render_template_values(
+        profile.submit_command,
+        script_path=remote_script,
+        workdir=cwd,
+    )
+    if not submit_argv:  # unreachable: check_protocol_profile ran at resolve time
+        raise FleetError(f"profile {profile.name!r} does not define `submit_command`")
+    completed = run_ssh_command(
+        secret,
+        allocate_tty=False,
+        remote_command=remote_shell_command(submit_argv, cwd=cwd),
+        capture_output=True,
+        timeout=SUBMIT_COMMAND_TIMEOUT,
+        **ssh_runtime,
+    )
+    return report_submitted_job(
+        completed,
+        profile,
+        output_path=output_path,
+        error_path=error_path,
+    )
 
 
 def report_submitted_job(
@@ -2252,6 +2395,7 @@ def target_display(
     target: TargetRecord,
     *,
     protocol_name: str,
+    role: str,
     pool_names: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Render one target for table or JSON output."""
@@ -2263,7 +2407,7 @@ def target_display(
         "enabled": target.enabled,
         "tags": list(target.tags),
         "default_profile": target.default_profile or "",
-        "scheduler": target.scheduler,
+        "role": role,
         "pools": sorted(pool_names),
     }
 
@@ -2277,8 +2421,6 @@ def protocol_display(protocol: ProtocolRecord) -> dict[str, Any]:
         "description": protocol.description or "",
         "default_profile": protocol.default_profile or "",
         "default_queue": default_queue.name if default_queue is not None else "",
-        "scheduler_required": protocol.scheduler_required,
-        "allow_login_exec": protocol.allow_login_exec,
         "smoke_gpu_probe": protocol.smoke_gpu_probe,
         "gpu_request_mode": protocol.gpu_request_mode,
         "job_runtime": protocol.job_runtime,
@@ -2403,7 +2545,6 @@ def default_plain_profile_template() -> str:
     fallback = """\
 version = 1
 name = "plain-ssh"
-kind = "direct"
 
 [script]
 interpreter = "/usr/bin/env bash"
@@ -2417,7 +2558,6 @@ def default_slurm_profile_template() -> str:
     fallback = """\
 version = 1
 name = "slurm-batch"
-kind = "scheduler"
 job_id_pattern = "Submitted batch job (?P<job_id>\\\\d+)"
 submit_command = ["sbatch", "{script}"]
 status_command = ["squeue", "--jobs", "{job_id}"]
@@ -2663,8 +2803,6 @@ def target_to_toml(target: TargetRecord) -> str:
         lines.append(f"ssh_host_alias = {toml_string(target.ssh_host_alias)}")
     if target.default_profile:
         lines.append(f"default_profile = {toml_string(target.default_profile)}")
-    if target.scheduler:
-        lines.append(f"scheduler = {toml_string(target.scheduler)}")
     return "\n".join(lines) + "\n"
 
 
@@ -2952,10 +3090,12 @@ def command_list(args: argparse.Namespace) -> int:
     for target in sorted(context.targets.values(), key=lambda item: item.name):
         if args.tag and args.tag not in target.tags:
             continue
+        protocol = context.resolve_protocol(target)
         rows.append(
             target_display(
                 target,
-                protocol_name=context.resolve_protocol(target).name,
+                protocol_name=protocol.name,
+                role=resolve_role(target, protocol),
                 pool_names=pool_index.get(target.name, []),
             )
         )
@@ -2969,9 +3109,9 @@ def command_list(args: argparse.Namespace) -> int:
                     "name",
                     "enabled",
                     "transport",
+                    "role",
                     "protocol",
                     "default_profile",
-                    "scheduler",
                     "tags",
                     "pools",
                 ],
@@ -2992,9 +3132,11 @@ def command_show(args: argparse.Namespace) -> int:
 
     if selector in context.targets:
         target = context.targets[selector]
+        protocol = context.resolve_protocol(target)
         payload = target_display(
             target,
-            protocol_name=context.resolve_protocol(target).name,
+            protocol_name=protocol.name,
+            role=resolve_role(target, protocol),
         )
         payload["kind"] = "target"
         if args.secret:
@@ -3137,13 +3279,13 @@ def command_import_ssh(args: argparse.Namespace) -> int:
     secret = infer_secret_from_ssh_alias(args.alias)
     target = TargetRecord(
         name=name,
-        protocol=args.protocol or ("slurm" if args.scheduler != "none" else None),
+        role=args.role,
+        protocol=args.protocol or "direct",
         workdir=args.workdir,
         tags=tuple(args.tag),
         secret_backend="file",
         secret_ref=str(secret_path),
         default_profile=args.profile or "plain-ssh",
-        scheduler=args.scheduler,
     )
     write_text_file(target_path, target_to_toml(target), mode=PRIVATE_FILE_MODE)
     write_text_file(secret_path, secret_to_toml(secret), mode=PRIVATE_FILE_MODE)
@@ -3221,13 +3363,13 @@ def command_migrate_env(args: argparse.Namespace) -> int:
                 inferred_workdir = str(remote_root_path.parent)
         target = TargetRecord(
             name=machine,
-            protocol=args.protocol or ("slurm" if args.scheduler != "none" else None),
+            role=args.role,
+            protocol=args.protocol or "direct",
             workdir=inferred_workdir,
             tags=tuple(args.tag),
             secret_backend="file",
             secret_ref=str(secret_path),
             default_profile=args.profile or "plain-ssh",
-            scheduler=args.scheduler,
         )
         write_text_file(target_path, target_to_toml(target), mode=PRIVATE_FILE_MODE)
         write_text_file(secret_path, secret_to_toml(secret), mode=PRIVATE_FILE_MODE)
@@ -3332,6 +3474,7 @@ def command_seed_pass(args: argparse.Namespace) -> int:
             name=target.name,
             enabled=target.enabled,
             transport=target.transport,
+            role=target.role,
             protocol=target.protocol,
             workdir=target.workdir,
             tags=target.tags,
@@ -3340,7 +3483,6 @@ def command_seed_pass(args: argparse.Namespace) -> int:
             secret_inline={},
             ssh_host_alias=target.ssh_host_alias,
             default_profile=target.default_profile,
-            scheduler=target.scheduler,
             metadata=target.metadata,
         )
         target_entry = pass_entry_name(prefix, "targets", target.name)
@@ -3595,10 +3737,6 @@ def command_smoke(args: argparse.Namespace) -> int:
             f"smoke check failed for {target.name!r} with exit code {completed.returncode}",
             exit_code=completed.returncode,
         )
-    if profile.kind not in {"direct", "scheduler"}:
-        raise FleetError(
-            f"profile {profile.name!r} uses unsupported kind {profile.kind!r}"
-        )
     return 0
 
 
@@ -3779,7 +3917,13 @@ def command_submit(args: argparse.Namespace) -> int:
     ssh_runtime = ssh_runtime_kwargs(context)
     cwd = resolve_remote_root(target, binding, args.cwd)
 
-    if profile.kind == "direct":
+    # Two paths, and the profile itself says which: a profile submits if and only
+    # if it defines `submit_command`.  Dispatching on a separate `profile.kind`
+    # opened a third path, reached only when kind and protocol disagreed, that ran
+    # `sbatch` on hosts with no scheduler and reported "requires --login" for a
+    # mismatch -- an error pointing the operator at running the job on the login
+    # node.  check_protocol_profile() now makes that disagreement unrepresentable.
+    if not profile.submit_command:
         if args.native_batch:
             raise FleetError("`--native-batch` only applies to scheduler profiles")
         ensure_no_resource_flags(
@@ -3823,134 +3967,74 @@ def command_submit(args: argparse.Namespace) -> int:
             local_script,
             ssh_runtime=ssh_runtime,
         )
-        submit_argv = render_template_values(
-            profile.submit_command,
-            script_path=remote_script,
-            workdir=cwd,
-        )
-        if not submit_argv:
-            raise FleetError(
-                f"profile {profile.name!r} does not define `submit_command`"
-            )
-        completed = run_ssh_command(
-            secret,
-            allocate_tty=False,
-            remote_command=remote_shell_command(submit_argv, cwd=cwd),
-            capture_output=True,
-            timeout=SUBMIT_COMMAND_TIMEOUT,
-            **ssh_runtime,
-        )
-        return report_submitted_job(completed, profile)
-
-    if protocol.kind == "slurm":
-        if protocol.native_batch_required:
-            raise FleetError(
-                f"protocol {protocol.name!r} requires `fleetctl submit --native-batch` "
-                "so the scheduler receives the site-native batch script unchanged"
-            )
-        ensure_job_id_pattern(profile)
-        queue = resolve_queue(protocol, args.queue)
-        remote_script = stage_remote_script(
+        return submit_staged_script(
             secret,
             profile,
-            local_script,
+            remote_script=remote_script,
+            cwd=cwd,
             ssh_runtime=ssh_runtime,
         )
-        job_base_root = protocol_base_root(target, binding, args.cwd)
-        output_dir, output_path, error_path = resolve_job_output_paths(
-            protocol,
-            base_root=job_base_root,
-            output_override=args.output,
-            error_override=args.error,
-        )
-        if output_dir:
-            ensure_remote_directory(secret, output_dir, ssh_runtime=ssh_runtime)
-        job_name = sanitize_job_name(args.job_name or local_script.stem)
-        wrapper_text = render_slurm_wrapper(
-            protocol=protocol,
-            remote_script=remote_script,
-            script_args=args.script_args,
-            interpreter=args.interpreter or profile.interpreter,
-            environment=profile.environment,
-            cwd=cwd,
-            queue=queue,
-            job_name=job_name,
-            time_limit=args.time,
-            gpus=args.gpus,
-            cpus_per_task=args.cpus_per_task,
-            mem=args.mem,
-            output_path=output_path,
-            error_path=error_path,
-        )
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
-            handle.write(wrapper_text)
-            wrapper_local = Path(handle.name)
-        try:
-            remote_wrapper = stage_remote_script(
-                secret,
-                profile,
-                wrapper_local,
-                ssh_runtime=ssh_runtime,
-            )
-        finally:
-            wrapper_local.unlink(missing_ok=True)
-        submit_argv = render_template_values(
-            profile.submit_command,
-            script_path=remote_wrapper,
-            workdir=cwd,
-        )
-        if not submit_argv:
-            raise FleetError(
-                f"profile {profile.name!r} does not define `submit_command`"
-            )
-        completed = run_ssh_command(
-            secret,
-            allocate_tty=False,
-            remote_command=remote_shell_command(submit_argv, cwd=cwd),
-            capture_output=True,
-            timeout=SUBMIT_COMMAND_TIMEOUT,
-            **ssh_runtime,
-        )
-        return report_submitted_job(
-            completed,
-            profile,
-            output_path=output_path,
-            error_path=error_path,
-        )
 
-    ensure_no_resource_flags(
-        args,
-        because=(
-            f"protocol {protocol.name!r} has kind={protocol.kind!r}, for which fleetctl "
-            f"renders no batch wrapper; profile {profile.name!r} submits your script "
-            "unchanged, so put the scheduler directives in the script itself"
-        ),
-    )
+    if protocol.native_batch_required:
+        raise FleetError(
+            f"protocol {protocol.name!r} requires `fleetctl submit --native-batch` "
+            "so the scheduler receives the site-native batch script unchanged"
+        )
     ensure_job_id_pattern(profile)
+    queue = resolve_queue(protocol, args.queue)
     remote_script = stage_remote_script(
         secret,
         profile,
         local_script,
         ssh_runtime=ssh_runtime,
     )
-    submit_argv = render_template_values(
-        profile.submit_command,
-        script_path=remote_script,
-        workdir=cwd,
+    job_base_root = protocol_base_root(target, binding, args.cwd)
+    output_dir, output_path, error_path = resolve_job_output_paths(
+        protocol,
+        base_root=job_base_root,
+        output_override=args.output,
+        error_override=args.error,
     )
-    if not submit_argv:
-        raise FleetError(
-            f"profile {profile.name!r} does not define `submit_command`"
+    if output_dir:
+        ensure_remote_directory(secret, output_dir, ssh_runtime=ssh_runtime)
+    job_name = sanitize_job_name(args.job_name or local_script.stem)
+    wrapper_text = render_slurm_wrapper(
+        protocol=protocol,
+        remote_script=remote_script,
+        script_args=args.script_args,
+        interpreter=args.interpreter or profile.interpreter,
+        environment=profile.environment,
+        cwd=cwd,
+        queue=queue,
+        job_name=job_name,
+        time_limit=args.time,
+        gpus=args.gpus,
+        cpus_per_task=args.cpus_per_task,
+        mem=args.mem,
+        output_path=output_path,
+        error_path=error_path,
+    )
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+        handle.write(wrapper_text)
+        wrapper_local = Path(handle.name)
+    try:
+        remote_wrapper = stage_remote_script(
+            secret,
+            profile,
+            wrapper_local,
+            ssh_runtime=ssh_runtime,
         )
-    completed = run_ssh_command(
+    finally:
+        wrapper_local.unlink(missing_ok=True)
+    return submit_staged_script(
         secret,
-        allocate_tty=False,
-        remote_command=remote_shell_command(submit_argv, cwd=cwd),
-        capture_output=True,
-        timeout=SUBMIT_COMMAND_TIMEOUT,
-        **ssh_runtime,
+        profile,
+        remote_script=remote_wrapper,
+        cwd=cwd,
+        ssh_runtime=ssh_runtime,
+        output_path=output_path,
+        error_path=error_path,
     )
-    return report_submitted_job(completed, profile)
 
 
 def run_job_command(
@@ -4142,6 +4226,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     problems.extend(toml_syntax_problems(paths))
     try:
         warnings.extend(target_schema_warnings(paths.targets_dir))
+        warnings.extend(deprecated_key_warnings(paths))
     except FleetError:
         pass  # already reported precisely by toml_syntax_problems above
 
@@ -4153,10 +4238,13 @@ def command_doctor(args: argparse.Namespace) -> int:
 
     context: FleetContext | None
     try:
+        # Non-strict: the per-target loop below reports each incoherence against
+        # the target that owns it, which beats one joined message.
         context = FleetContext.load(
             config_home=args.config_home,
             state_home=args.state_home,
             cache_home=args.cache_home,
+            strict=False,
         )
     except FleetError as exc:
         problems.append(f"fleet config does not load: {exc}")
@@ -4178,11 +4266,14 @@ def command_doctor(args: argparse.Namespace) -> int:
             except FleetError as exc:
                 problems.append(f"target {target.name!r}: {exc}")
                 profile = None
-            if profile is not None and protocol.kind == "slurm" and not profile.submit_command:
-                problems.append(
-                    f"target {target.name!r} resolves to profile {profile.name!r}, "
-                    f"which has no `submit_command`, but protocol {protocol.name!r} "
-                    "is scheduler-backed: `fleetctl submit` cannot work here"
+            if target.role is None:
+                # An inferred role is the conservative reading of the protocol, not
+                # a fact about the machine.  Say so once per target, by name.
+                warnings.append(
+                    f"target {target.name!r} declares no `role`; fleetctl inferred "
+                    f"{resolve_role(target, protocol)!r} from protocol "
+                    f"{protocol.name!r}. Run `fleetctl migrate-config` to make it "
+                    "explicit."
                 )
             try:
                 secret = context.resolve_secret(target)
@@ -4479,9 +4570,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Protocol name to attach to the imported target",
     )
     import_ssh_parser.add_argument(
-        "--scheduler",
-        default="none",
-        help="Scheduler label for metadata only",
+        "--role",
+        choices=ROLES,
+        help="What the imported machine is, which decides what may run on it",
     )
     import_ssh_parser.add_argument(
         "--project-path",
@@ -4525,9 +4616,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Protocol name to attach to imported targets",
     )
     migrate_env_parser.add_argument(
-        "--scheduler",
-        default="none",
-        help="Scheduler label for imported targets",
+        "--role",
+        choices=ROLES,
+        help="Role to assign to every imported machine",
     )
     migrate_env_parser.add_argument(
         "--project-path",
