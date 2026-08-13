@@ -2049,20 +2049,51 @@ def configured_machine_names(env: dict[str, str], prefix: str) -> list[str]:
     return names
 
 
+TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def toml_string(value: str) -> str:
+    """Quote one value as a TOML basic string."""
+    out: list[str] = []
+    for char in value:
+        if char in TOML_ESCAPES:
+            out.append(TOML_ESCAPES[char])
+        elif char < " " or char == "\x7f":
+            out.append(f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    return '"' + "".join(out) + '"'
+
+
+def toml_key(key: str) -> str:
+    """Quote one TOML key, leaving it bare when that is valid."""
+    if key and key.isascii() and all(c.isalnum() or c in "-_" for c in key):
+        return key
+    return toml_string(key)
+
+
 def secret_to_toml(secret: FleetSecret) -> str:
     """Serialize a secret file."""
     lines = [
-        f'host = "{secret.host}"',
-        f'user = "{secret.user}"',
+        f"host = {toml_string(secret.host)}",
+        f"user = {toml_string(secret.user)}",
         f"port = {secret.port}",
-        f'auth = "{secret.auth}"',
+        f"auth = {toml_string(secret.auth)}",
     ]
     if secret.identity_file:
-        lines.append(f'identity_file = "{secret.identity_file}"')
+        lines.append(f"identity_file = {toml_string(secret.identity_file)}")
     if secret.password:
-        lines.append(f'password = "{secret.password}"')
+        lines.append(f"password = {toml_string(secret.password)}")
     if secret.proxy_jump:
-        lines.append(f'proxy_jump = "{secret.proxy_jump}"')
+        lines.append(f"proxy_jump = {toml_string(secret.proxy_jump)}")
     lines.append(f"identities_only = {'true' if secret.identities_only else 'false'}")
     lines.append(f"forward_agent = {'true' if secret.forward_agent else 'false'}")
     lines.append(f"compression = {'true' if secret.compression else 'false'}")
@@ -2071,10 +2102,11 @@ def secret_to_toml(secret: FleetSecret) -> str:
     lines.append(f"server_alive_count_max = {secret.server_alive_count_max}")
     if secret.strict_host_key_checking:
         lines.append(
-            f'strict_host_key_checking = "{secret.strict_host_key_checking}"'
+            "strict_host_key_checking = "
+            f"{toml_string(secret.strict_host_key_checking)}"
         )
     for key, value in sorted(secret.extra_options.items()):
-        lines.append(f'ssh_option.{key} = "{value}"')
+        lines.append(f"ssh_option.{toml_key(key)} = {toml_string(value)}")
     return "\n".join(lines) + "\n"
 
 
@@ -2082,26 +2114,26 @@ def target_to_toml(target: TargetRecord) -> str:
     """Serialize a target file."""
     lines = [
         "version = 1",
-        f'name = "{target.name}"',
+        f"name = {toml_string(target.name)}",
         f"enabled = {'true' if target.enabled else 'false'}",
-        f'transport = "{target.transport}"',
+        f"transport = {toml_string(target.transport)}",
     ]
     if target.protocol:
-        lines.append(f'protocol = "{target.protocol}"')
+        lines.append(f"protocol = {toml_string(target.protocol)}")
     if target.workdir:
-        lines.append(f'workdir = "{target.workdir}"')
+        lines.append(f"workdir = {toml_string(target.workdir)}")
     if target.tags:
-        tags = ", ".join(f'"{tag}"' for tag in target.tags)
+        tags = ", ".join(toml_string(tag) for tag in target.tags)
         lines.append(f"tags = [{tags}]")
-    lines.append(f'secret_backend = "{target.secret_backend}"')
+    lines.append(f"secret_backend = {toml_string(target.secret_backend)}")
     if target.secret_ref:
-        lines.append(f'secret_ref = "{target.secret_ref}"')
+        lines.append(f"secret_ref = {toml_string(target.secret_ref)}")
     if target.ssh_host_alias:
-        lines.append(f'ssh_host_alias = "{target.ssh_host_alias}"')
+        lines.append(f"ssh_host_alias = {toml_string(target.ssh_host_alias)}")
     if target.default_profile:
-        lines.append(f'default_profile = "{target.default_profile}"')
+        lines.append(f"default_profile = {toml_string(target.default_profile)}")
     if target.scheduler:
-        lines.append(f'scheduler = "{target.scheduler}"')
+        lines.append(f"scheduler = {toml_string(target.scheduler)}")
     return "\n".join(lines) + "\n"
 
 
