@@ -1001,13 +1001,40 @@ def write_text_if_missing(path: Path, content: str, *, mode: int) -> None:
     write_text_file(path, content, mode=mode, force=False)
 
 
-def clear_toml_dir(path: Path) -> None:
-    """Remove managed TOML files from PATH."""
-    if not path.exists():
-        return
-    for entry in path.glob("*.toml"):
-        entry.unlink()
+def carry_secret_files(source_dir: Path, dest_dir: Path) -> list[str]:
+    """Copy existing secret files into a staging tree so a deploy cannot lose them."""
+    if not source_dir.is_dir():
+        return []
+    carried: list[str] = []
+    for entry in sorted(source_dir.glob("*.toml")):
+        destination = dest_dir / entry.name
+        shutil.copy2(entry, destination)
+        os.chmod(destination, PRIVATE_FILE_MODE)
+        carried.append(entry.name)
+    return carried
 
+
+def swap_config_tree(staging: Path, live: Path) -> Path | None:
+    """Replace `live` with `staging` by rename, keeping one previous generation.
+
+    Both paths share a parent, so each rename is atomic: no reader ever sees a
+    half-written config tree, and a failure part-way through puts the old tree
+    back where it was.
+    """
+    previous = live.with_name(live.name + ".prev")
+    rotated = False
+    if live.exists():
+        if previous.exists():
+            shutil.rmtree(previous)
+        os.replace(live, previous)
+        rotated = True
+    try:
+        os.replace(staging, live)
+    except OSError:
+        if rotated and not live.exists():
+            os.replace(previous, live)
+        raise
+    return previous if rotated else None
 
 def run_pass_show(secret_ref: str) -> str:
     """Fetch one pass entry."""
@@ -2730,8 +2757,15 @@ def command_seed_pass(args: argparse.Namespace) -> int:
 
 
 def command_deploy_config(args: argparse.Namespace) -> int:
-    """Render ~/.config/fleet from public templates and pass-backed private state."""
-    paths = build_paths(
+    """Render ~/.config/fleet from public templates and pass-backed private state.
+
+    The new tree is rendered and validated in a sibling staging directory, and the
+    live config is only ever replaced by a rename once the new tree is known to
+    load.  A failed fetch -- locked gpg-agent, expired card, missing `pass`, a
+    mistyped `--pass-prefix` -- therefore leaves the working config untouched
+    instead of deleting it first and reporting the error afterwards.
+    """
+    live = build_paths(
         config_home=args.config_home,
         state_home=args.state_home,
         cache_home=args.cache_home,
@@ -2740,62 +2774,102 @@ def command_deploy_config(args: argparse.Namespace) -> int:
     if not prefix:
         raise FleetError("`--pass-prefix` must not be empty")
 
-    ensure_private_dir(paths.config_home, mode=PRIVATE_DIR_MODE)
-    ensure_private_dir(paths.targets_dir, mode=PRIVATE_DIR_MODE)
-    ensure_private_dir(paths.pools_dir, mode=PRIVATE_DIR_MODE)
-    ensure_private_dir(paths.protocols_dir, mode=PRIVATE_DIR_MODE)
-    ensure_private_dir(paths.profiles_dir, mode=PRIVATE_DIR_MODE)
-    ensure_private_dir(paths.secrets_dir, mode=PRIVATE_DIR_MODE)
-
-    clear_toml_dir(paths.targets_dir)
-    clear_toml_dir(paths.pools_dir)
-    clear_toml_dir(paths.protocols_dir)
-    clear_toml_dir(paths.profiles_dir)
-    clear_toml_dir(paths.secrets_dir)
-
-    config_entry = pass_entry_name(prefix, "config")
-    config_text = run_pass_show(config_entry) if pass_entry_exists(config_entry) else default_config_template()
-    write_text_file(paths.config_file, config_text, mode=PRIVATE_FILE_MODE)
-
-    projects_entry = pass_entry_name(prefix, "projects")
-    projects_text = run_pass_show(projects_entry) if pass_entry_exists(projects_entry) else default_projects_template()
-    write_text_file(paths.projects_file, projects_text, mode=PRIVATE_FILE_MODE)
-
-    write_text_file(
-        paths.profiles_dir / "plain-ssh.toml",
-        default_plain_profile_template(),
-        mode=PRIVATE_FILE_MODE,
+    staging_root = live.config_home.with_name(live.config_home.name + ".new")
+    if staging_root.exists():
+        shutil.rmtree(staging_root)
+    paths = build_paths(
+        config_home=staging_root,
+        state_home=args.state_home,
+        cache_home=args.cache_home,
     )
-    write_text_file(
-        paths.profiles_dir / "slurm-batch.toml",
-        default_slurm_profile_template(),
-        mode=PRIVATE_FILE_MODE,
-    )
-    write_pass_tree_to_dir(pass_entry_name(prefix, "profiles"), paths.profiles_dir)
-    targets_written = write_pass_tree_to_dir(pass_entry_name(prefix, "targets"), paths.targets_dir)
-    write_pass_tree_to_dir(pass_entry_name(prefix, "pools"), paths.pools_dir)
-    write_pass_tree_to_dir(pass_entry_name(prefix, "protocols"), paths.protocols_dir)
 
-    if not targets_written:
-        raise FleetError(
-            f"no target entries found under pass prefix {pass_entry_name(prefix, 'targets')!r}"
+    try:
+        ensure_private_dir(paths.config_home, mode=PRIVATE_DIR_MODE)
+        ensure_private_dir(paths.targets_dir, mode=PRIVATE_DIR_MODE)
+        ensure_private_dir(paths.pools_dir, mode=PRIVATE_DIR_MODE)
+        ensure_private_dir(paths.protocols_dir, mode=PRIVATE_DIR_MODE)
+        ensure_private_dir(paths.profiles_dir, mode=PRIVATE_DIR_MODE)
+        ensure_private_dir(paths.secrets_dir, mode=PRIVATE_DIR_MODE)
+
+        # Secret files are the one thing here that cannot be regenerated from
+        # templates plus `pass`, so they are carried forward rather than dropped.
+        carried = carry_secret_files(live.secrets_dir, paths.secrets_dir)
+
+        config_entry = pass_entry_name(prefix, "config")
+        config_text = (
+            run_pass_show(config_entry)
+            if pass_entry_exists(config_entry)
+            else default_config_template()
+        )
+        write_text_file(paths.config_file, config_text, mode=PRIVATE_FILE_MODE)
+
+        projects_entry = pass_entry_name(prefix, "projects")
+        projects_text = (
+            run_pass_show(projects_entry)
+            if pass_entry_exists(projects_entry)
+            else default_projects_template()
+        )
+        write_text_file(paths.projects_file, projects_text, mode=PRIVATE_FILE_MODE)
+
+        write_text_file(
+            paths.profiles_dir / "plain-ssh.toml",
+            default_plain_profile_template(),
+            mode=PRIVATE_FILE_MODE,
+        )
+        write_text_file(
+            paths.profiles_dir / "slurm-batch.toml",
+            default_slurm_profile_template(),
+            mode=PRIVATE_FILE_MODE,
+        )
+        write_pass_tree_to_dir(pass_entry_name(prefix, "profiles"), paths.profiles_dir)
+        targets_written = write_pass_tree_to_dir(
+            pass_entry_name(prefix, "targets"), paths.targets_dir
+        )
+        write_pass_tree_to_dir(pass_entry_name(prefix, "pools"), paths.pools_dir)
+        write_pass_tree_to_dir(
+            pass_entry_name(prefix, "protocols"), paths.protocols_dir
         )
 
-    deployed = FleetContext.load(
-        config_home=paths.config_home,
-        state_home=paths.state_home,
-        cache_home=paths.cache_home,
-    )
-    for target in deployed.targets.values():
-        if target.secret_backend != "pass":
+        if not targets_written:
             raise FleetError(
-                f"deployed target {target.name!r} does not use pass-backed secrets"
+                "no target entries found under pass prefix "
+                f"{pass_entry_name(prefix, 'targets')!r}; the existing config at "
+                f"{live.config_home} has been left alone"
             )
-        deployed.resolve_secret(target)
+
+        deployed = FleetContext.load(
+            config_home=paths.config_home,
+            state_home=paths.state_home,
+            cache_home=paths.cache_home,
+        )
+        for target in deployed.targets.values():
+            if target.secret_backend != "pass":
+                raise FleetError(
+                    f"deployed target {target.name!r} does not use pass-backed "
+                    "secrets; `deploy-config` can only render a fleet whose secrets "
+                    "all live in `pass` (run `fleetctl seed-pass` first)"
+                )
+            deployed.resolve_secret(target)
+
+        previous = swap_config_tree(staging_root, live.config_home)
+    finally:
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+    if carried:
+        print(
+            f"note: carried {len(carried)} plaintext secret file(s) forward into "
+            f"{live.secrets_dir} ({', '.join(carried)}). Every deployed target is "
+            "pass-backed, so these are no longer read; remove them once you are "
+            "satisfied the pass entries are complete.",
+            file=sys.stderr,
+        )
+    if previous is not None:
+        print(f"note: previous config kept at {previous}", file=sys.stderr)
 
     if args.doctor:
         payload = {
-            "config_home": str(paths.config_home),
+            "config_home": str(live.config_home),
             "targets": sorted(deployed.targets),
             "pools": sorted(deployed.pools),
             "protocols": sorted(deployed.protocols),
@@ -2803,9 +2877,8 @@ def command_deploy_config(args: argparse.Namespace) -> int:
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        print(paths.config_home)
+        print(live.config_home)
     return 0
-
 
 def command_ssh(args: argparse.Namespace) -> int:
     """Open one interactive SSH session."""
