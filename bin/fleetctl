@@ -853,6 +853,7 @@ def resolve_remote_root(
 
 CONTROL_COMMAND_TIMEOUT = 60.0
 SUBMIT_COMMAND_TIMEOUT = 120.0
+PASS_COMMAND_TIMEOUT = 120.0
 
 SUBMIT_RESOURCE_FLAGS = (
     ("queue", "--queue"),
@@ -1016,9 +1017,15 @@ def run_pass_show(secret_ref: str) -> str:
             check=False,
             capture_output=True,
             text=True,
+            timeout=PASS_COMMAND_TIMEOUT,
         )
     except FileNotFoundError as exc:
         raise FleetError("`pass` is required for pass-backed secrets") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise FleetError(
+            f"`pass show {secret_ref}` timed out after {PASS_COMMAND_TIMEOUT:g}s; "
+            "gpg-agent is probably waiting on a passphrase or a smartcard"
+        ) from exc
     if completed.returncode != 0:
         message = completed.stderr.strip() or completed.stdout.strip()
         raise FleetError(
@@ -1074,9 +1081,15 @@ def run_pass_insert(secret_ref: str, content: str, *, force: bool) -> None:
             capture_output=True,
             text=True,
             env=env,
+            timeout=PASS_COMMAND_TIMEOUT,
         )
     except FileNotFoundError as exc:
         raise FleetError("`pass` is required for pass-backed fleet config") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise FleetError(
+            f"`pass` timed out after {PASS_COMMAND_TIMEOUT:g}s writing {secret_ref}; "
+            "gpg-agent is probably waiting on a passphrase or a smartcard"
+        ) from exc
     if completed.returncode != 0:
         message = completed.stderr.strip() or completed.stdout.strip()
         raise FleetError(
@@ -1368,6 +1381,7 @@ def resolve_remote_home(
         allocate_tty=False,
         remote_command=shlex.join(["/bin/sh", "-c", 'printf "%s" "$HOME"']),
         capture_output=True,
+        timeout=CONTROL_COMMAND_TIMEOUT,
         **(ssh_runtime or {}),
     )
     home = completed.stdout.strip()
@@ -1401,6 +1415,7 @@ def stage_remote_script(
         secret,
         allocate_tty=False,
         remote_command=remote_shell_command(["mkdir", "-p", remote_dir]),
+        timeout=CONTROL_COMMAND_TIMEOUT,
         **ssh_runtime,
     )
     if mkdir.returncode != 0:
@@ -1417,6 +1432,7 @@ def stage_remote_script(
             **ssh_runtime,
         ),
         env=ssh_env(secret),
+        timeout=CONTROL_COMMAND_TIMEOUT,
     )
     if scp.returncode != 0:
         raise FleetError(
@@ -1427,6 +1443,7 @@ def stage_remote_script(
         secret,
         allocate_tty=False,
         remote_command=remote_shell_command(["chmod", "700", remote_path]),
+        timeout=CONTROL_COMMAND_TIMEOUT,
         **ssh_runtime,
     )
     if chmod.returncode != 0:
@@ -1458,6 +1475,7 @@ def ensure_remote_directory(
         secret,
         allocate_tty=False,
         remote_command=remote_shell_command(["mkdir", "-p", remote_path]),
+        timeout=CONTROL_COMMAND_TIMEOUT,
         **(ssh_runtime or {}),
     )
     if mkdir.returncode != 0:
@@ -1890,7 +1908,11 @@ def int_setting(raw: dict[str, str], key: str, default: int) -> int:
 
 def infer_secret_from_ssh_alias(alias: str) -> FleetSecret:
     """Resolve one existing SSH alias from the local SSH client."""
-    completed = run_command(["ssh", "-G", alias], capture_output=True)
+    completed = run_command(
+        ["ssh", "-G", alias],
+        capture_output=True,
+        timeout=CONTROL_COMMAND_TIMEOUT,
+    )
     if completed.returncode != 0:
         message = completed.stderr.strip() or completed.stdout.strip()
         raise FleetError(
@@ -2889,6 +2911,7 @@ def command_smoke(args: argparse.Namespace) -> int:
         allocate_tty=False,
         remote_command=remote_shell_command(smoke_argv),
         capture_output=True,
+        timeout=CONTROL_COMMAND_TIMEOUT,
         **ssh_runtime_kwargs(context),
     )
     if completed.stdout:
@@ -3037,6 +3060,7 @@ def command_sync(args: argparse.Namespace) -> int:
             secret,
             allocate_tty=False,
             remote_command=remote_shell_command(["mkdir", "-p", remote_parent]),
+            timeout=CONTROL_COMMAND_TIMEOUT,
             **ssh_runtime,
         )
         if mkdir.returncode != 0:
@@ -3276,6 +3300,7 @@ def run_job_command(
         allocate_tty=False,
         remote_command=remote_shell_command(argv, cwd=cwd),
         capture_output=True,
+        timeout=CONTROL_COMMAND_TIMEOUT,
         **ssh_runtime_kwargs(context),
     )
     if completed.stdout:
