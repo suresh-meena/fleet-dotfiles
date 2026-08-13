@@ -3247,7 +3247,10 @@ def command_sync(args: argparse.Namespace) -> int:
         command += [local, remote]
     else:
         local = str(Path(args.local_path).expanduser().resolve())
-        remote = f"{secret.target}:{default_remote}"
+        # Mirror push: transfer the *contents* of the remote directory, so that
+        # `pull` is the inverse of `push` instead of nesting a copy one level
+        # deeper.  This also makes `--delete` mean the same thing both ways.
+        remote = f"{secret.target}:{default_remote.rstrip('/')}/"
         command += [remote, local]
 
     completed = run_command(command, env=ssh_env(secret))
