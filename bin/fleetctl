@@ -102,6 +102,7 @@ class FleetSecret:
     server_alive_interval: int = 30
     server_alive_count_max: int = 3
     strict_host_key_checking: str | None = None
+    batch_mode: bool | None = None
     extra_options: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -769,6 +770,7 @@ def parse_secret_dict(raw: dict[str, Any]) -> FleetSecret:
     password = optional_str(raw.get("password"))
     proxy_jump = optional_str(raw.get("proxy_jump"))
     strict_host_key_checking = optional_str(raw.get("strict_host_key_checking"))
+    batch_mode_raw = raw.get("batch_mode")
     extra_options_raw = raw.get("ssh_option", {})
     return FleetSecret(
         host=host,
@@ -785,6 +787,7 @@ def parse_secret_dict(raw: dict[str, Any]) -> FleetSecret:
         server_alive_interval=int(raw.get("server_alive_interval", 30)),
         server_alive_count_max=int(raw.get("server_alive_count_max", 3)),
         strict_host_key_checking=strict_host_key_checking,
+        batch_mode=None if batch_mode_raw is None else bool(batch_mode_raw),
         extra_options={
             str(key): str(value) for key, value in dict(extra_options_raw).items()
         },
@@ -1210,11 +1213,37 @@ def ssh_option_parts(
             "-o",
             "PubkeyAuthentication=no",
         ]
-    else:
+    elif use_batch_mode(secret):
         options += ["-o", "BatchMode=yes"]
     for key, value in secret.extra_options.items():
         options += ["-o", f"{key}={value}"]
     return options
+
+
+def interactive_terminal_available() -> bool:
+    """True when a human could answer an ssh passphrase or 2FA prompt."""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            if stream is not None and stream.isatty():
+                return True
+        except (AttributeError, ValueError):
+            continue
+    return False
+
+
+def use_batch_mode(secret: FleetSecret) -> bool:
+    """Decide whether ssh should be forbidden from prompting.
+
+    `BatchMode=yes` used to be forced on every key-auth target, which makes a
+    passphrase-protected key with no agent loaded, or a site using
+    keyboard-interactive 2FA, impossible to reach at all.  Prompting is allowed
+    whenever there is a terminal to answer on; with no terminal -- cron, CI, a
+    pipeline -- batch mode still turns a silent hang into a fast clean failure.
+    `batch_mode` in the secret record overrides the heuristic either way.
+    """
+    if secret.batch_mode is not None:
+        return secret.batch_mode
+    return not interactive_terminal_available()
 
 
 def ssh_transport_prefix(secret: FleetSecret) -> list[str]:
@@ -2105,6 +2134,8 @@ def secret_to_toml(secret: FleetSecret) -> str:
             "strict_host_key_checking = "
             f"{toml_string(secret.strict_host_key_checking)}"
         )
+    if secret.batch_mode is not None:
+        lines.append(f"batch_mode = {'true' if secret.batch_mode else 'false'}")
     for key, value in sorted(secret.extra_options.items()):
         lines.append(f"ssh_option.{toml_key(key)} = {toml_string(value)}")
     return "\n".join(lines) + "\n"
