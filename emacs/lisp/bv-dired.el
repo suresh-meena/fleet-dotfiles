@@ -48,9 +48,28 @@
   (define-key dired-mode-map "q" 'kill-current-buffer)
   (add-hook 'dired-mode-hook 'dired-hide-details-mode))
 
+;;; Remote copy
+
+;; Deliberately not `-az --delete'.
+;;
+;; No `--delete': the destination is read with `dired-dwim-target-directory',
+;; which prefills the other dired window, and `dired-dwim-target' is t above.
+;; Accepting that prefill with `--delete' set erases everything in that
+;; directory that is not in the marked source, and `delete-by-moving-to-trash'
+;; is nil, so there is nothing to recover from. Mirror deliberately with
+;; `dired-rsync-transient' instead, which toggles flags per invocation.
+;;
+;; `-rlptD' rather than `-a': `-a' is `-rlptgoD', and `-o' silently does nothing
+;; unless the receiving rsync runs as root, which it does not here.
+;;
+;; `--compress-level=1' rather than bare `-z' (level 6): every clustered host is
+;; reachable through a Raspberry Pi bridge, where the compressor is the
+;; bottleneck and not the link. Matches what `fleetctl sync' uses.
 (with-eval-after-load 'dired-rsync
   (when (boundp 'dired-rsync-options)
-    (setq dired-rsync-options "-az --info=progress2 --delete")))
+    (setq dired-rsync-options
+          (concat "-rlptD -z --compress-level=1 --info=progress2"
+                  " -h --partial"))))
 
 (with-eval-after-load 'ls-lisp
   (when (boundp 'ls-lisp-use-insert-directory-program)
