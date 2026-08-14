@@ -254,8 +254,16 @@
 
 ;; Performance improvements
 (setq tramp-use-ssh-controlmaster-options t)
-(setq tramp-chunksize 500)
-(setq tramp-default-proxies-alist nil)
+
+;; `tramp-chunksize' is deliberately NOT set. It exists for ssh builds that
+;; lose data on large writes, and a non-nil value splits every inline transfer
+;; into chunks that small with a delay between them. It was 500 here, which
+;; throttled every remote save for a bug this fleet does not have. Set it again
+;; only if a transfer actually corrupts.
+
+;; Not `(setq tramp-default-proxies-alist nil)'. That was already the default,
+;; and writing it kept the one mechanism that reaches a bridge-only host from
+;; ever being set from elsewhere in this config.
 
 ;; Add TRAMP own remote path
 (add-to-list 'tramp-remote-path 'tramp-own-remote-path)
