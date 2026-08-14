@@ -6501,15 +6501,17 @@ def command_jobs(args: argparse.Namespace, context: FleetContext) -> int:
     records.reverse()
     if not args.all:
         records = records[: max(args.limit, 0)]
-    emit_rows(
-        records,
-        JOB_LIST_COLUMNS,
-        as_json=bool(args.json),
-        when_empty=(
-            f"no submissions recorded in {jobs_ledger_file(context.paths)}; "
+    if not records and not args.json:
+        # Not `when_empty`: that is for emptiness which is itself a fault, and a
+        # fleet that has not submitted anything yet is working correctly. Exiting
+        # non-zero here would also disagree with the `--json` arm, which already
+        # answers `[]` and succeeds.
+        print(
+            f"no submissions recorded yet in {jobs_ledger_file(context.paths)}\n"
             "`fleetctl submit` appends one line per job the scheduler accepted"
-        ),
-    )
+        )
+        return 0
+    emit_rows(records, JOB_LIST_COLUMNS, as_json=bool(args.json))
     return 0
 
 
