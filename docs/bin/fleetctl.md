@@ -93,9 +93,17 @@ refused as a hop, because sshpass hands one password to the whole process tree.
 `--route direct` or `--route via:<bridge>` pins a *declared* route; fleetctl
 will not invent one. `fleetctl list --format topology` prints the graph.
 
-Current limit: the first declared route is the one used — nothing degrades
-automatically yet — and both routes to one host share a control socket, because
-OpenSSH's `%C` does not hash the ProxyCommand.
+Fallback is automatic, and happens once per control socket rather than once per
+command: a warm master means the route already works, and a cold one is filled
+by trying each route in declared order until a master comes up. Direct gets 5
+seconds and a bridge 10, so preferring direct costs one timeout per
+`ControlPersist` window, and only when direct is down. Each route gets its own
+socket, since `%C` does not hash the ProxyCommand. `--no-fallback` refuses to
+degrade.
+
+Once a master exists a failing command is a failing command — never retried,
+never re-routed. That is what keeps `exec` and `submit` at-most-once: a
+re-routed `sbatch` would queue the job twice.
 
 ## Start
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import difflib
 import json
 import os
@@ -822,6 +823,7 @@ class Plan:
     admin: bool
     routes: tuple[str, ...] = DEFAULT_REACH
     _secret: FleetSecret | None = field(default=None, compare=False, repr=False)
+    _route: str | None = field(default=None, compare=False, repr=False)
 
     @property
     def secret(self) -> FleetSecret:
@@ -841,15 +843,27 @@ class Plan:
     def route(self) -> str:
         """The route this plan uses.
 
-        For a target that declares no bridge this is the only candidate; with a
-        fallback declared it is the one tried first, which is what the argv
-        builders need in order to be printable before any connection exists.
+        Before a connection exists this is the first candidate, which is what the
+        argv builders need in order to be printable; once `connect` has brought a
+        control master up it is the route that actually carries the traffic.
         """
+        if self._route is not None:
+            return self._route
         return self.routes[0] if self.routes else ROUTE_DIRECT
 
     def ssh_runtime(self) -> dict[str, Any]:
         """Return the fleet-managed SSH settings for this plan, hop included."""
         return ssh_runtime_kwargs(self.context, target=self.target, route=self.route)
+
+    def connect(self) -> dict[str, Any]:
+        """Bring up a route and return the SSH settings that use it.
+
+        The one boundary between describing a plan and acting on one: `explain`
+        and `--dry-run` call `ssh_runtime` and never touch a network, while every
+        host-touching verb calls this and gets the route that came up.
+        """
+        ensure_route(self)
+        return self.ssh_runtime()
 
     def ssh_connect_argv(self) -> list[str]:
         """The ssh invocation this plan will use, without the remote command."""
@@ -869,6 +883,7 @@ class Plan:
             "target": self.target.name,
             "role": resolve_role(self.target, self.protocol),
             "reach": list(self.target.reach),
+            "routes": list(self.routes),
             "route": self.route,
             "protocol": self.protocol.name,
             "protocol_kind": self.protocol.kind,
@@ -903,20 +918,31 @@ def build_plan(context: FleetContext, args: argparse.Namespace, verb: str) -> Pl
         selector=selector,
         pool=context.pools.get(selector) if selector else None,
         admin=admin,
-        routes=resolve_routes(target, getattr(args, "route", None)),
+        routes=resolve_routes(
+            target,
+            getattr(args, "route", None),
+            no_fallback=bool(getattr(args, "no_fallback", False)),
+        ),
     )
 
 
-def resolve_routes(target: TargetRecord, requested: str | None) -> tuple[str, ...]:
+def resolve_routes(
+    target: TargetRecord,
+    requested: str | None,
+    *,
+    no_fallback: bool = False,
+) -> tuple[str, ...]:
     """Return the routes to try for TARGET, in order.
 
     `--route` picks one of the declared routes rather than inventing one: a route
     fleetctl has never been told about is a guess about someone else's network,
     and the failure it produces is a timeout rather than an error.
+    `--no-fallback` keeps only the first, for when reaching a host the slow way is
+    worse than not reaching it at all.
     """
     declared = target.reach or DEFAULT_REACH
     if requested is None:
-        return declared
+        return declared[:1] if no_fallback else declared
     route = parse_route(requested, what=f"--route for target {target.name!r}")
     if route not in declared:
         raise FleetError(
@@ -1866,6 +1892,23 @@ def resolve_remote_root(
 SSH_TRANSPORT_FAILURE = 255
 
 CONTROL_COMMAND_TIMEOUT = 60.0
+
+# How long one route gets to bring up a control master before the next is tried.
+# Direct gets the shorter deadline because this is the entire cost of preferring
+# it: one timeout per ControlPersist window, paid only when direct is down.
+DIRECT_CONNECT_TIMEOUT = 5
+BRIDGE_CONNECT_TIMEOUT = 10
+
+# `ssh -O check` speaks only to a local unix socket, so anything slower than this
+# is a hung socket rather than a slow network.
+CONTROL_CHECK_TIMEOUT = 10.0
+
+# A unix domain socket path cannot exceed 104 bytes on macOS or 108 on Linux, and
+# ssh reports the overflow as a bare "ControlPath too long" from wherever in a
+# ProxyCommand chain it happened -- which is not where anyone looks. `%C` expands
+# to a 40-character hash, so the length is predictable enough to refuse up front.
+CONTROL_PATH_LIMIT = 100
+CONTROL_PATH_HASH_WIDTH = 40
 SUBMIT_COMMAND_TIMEOUT = 120.0
 PASS_COMMAND_TIMEOUT = 120.0
 
@@ -2216,6 +2259,47 @@ def escape_ssh_percent(text: str) -> str:
     return text.replace("%", "%%")
 
 
+def route_connect_timeout(route: str) -> int:
+    """Return how long ROUTE gets to bring up a control master."""
+    if route_bridge(route) is None:
+        return DIRECT_CONNECT_TIMEOUT
+    return BRIDGE_CONNECT_TIMEOUT
+
+
+def route_control_path(control_path: str, route: str) -> str:
+    """Return the control socket that belongs to ROUTE.
+
+    OpenSSH's `%C` hashes the local host, remote host, port and user -- not the
+    ProxyCommand -- so without this suffix both routes to one host share a
+    socket, and a warm direct master goes on serving a `--route via:` command
+    until ControlPersist expires.  The suffix is what makes the route part of a
+    connection's identity, and therefore what lets a fallback mean anything.
+    """
+    bridge = route_bridge(route)
+    token = ROUTE_DIRECT if bridge is None else f"via-{bridge}"
+    path = f"{control_path}-{token}"
+    expanded = len(path) + path.count("%C") * (CONTROL_PATH_HASH_WIDTH - 2)
+    if expanded > CONTROL_PATH_LIMIT:
+        raise FleetError(
+            f"the control socket for route {route!r} would be {expanded} bytes, "
+            f"over the {CONTROL_PATH_LIMIT} a unix socket allows: shorten "
+            '`control_path` under [ssh] in config.toml, e.g. "~/.cache/fleet/m/%C"'
+        )
+    return path
+
+
+def route_runtime(base: dict[str, Any], route: str) -> dict[str, Any]:
+    """Return BASE carrying the control socket that belongs to ROUTE.
+
+    An empty `control_path` turns multiplexing off, and then there is no socket to
+    suffix and no master to establish: the first route becomes the only route.
+    """
+    control_path = base.get("control_path")
+    if not control_path:
+        return dict(base)
+    return {**base, "control_path": route_control_path(str(control_path), route)}
+
+
 def build_proxy_command(
     context: FleetContext,
     route: str,
@@ -2252,6 +2336,9 @@ def build_proxy_command(
             "Give the bridge a key -- it is the host every other host is reached "
             "through."
         )
+    # The bridge is reached over its own first route and gets that route's
+    # socket: a bridge behind a bridge is the same problem one level down.
+    bridge_route = bridge.reach[0] if bridge.reach else ROUTE_DIRECT
     parts = ["ssh", "-W", "%h:%p", "-p", str(secret.port)]
     parts += [
         escape_ssh_percent(part)
@@ -2259,11 +2346,11 @@ def build_proxy_command(
             secret,
             proxy_command=build_proxy_command(
                 context,
-                bridge.reach[0] if bridge.reach else ROUTE_DIRECT,
+                bridge_route,
                 base,
                 chain=(*chain, bridge_name),
             ),
-            **base,
+            **route_runtime(base, bridge_route),
         )
     ]
     parts.append(secret.target)
@@ -2286,7 +2373,10 @@ def ssh_runtime_kwargs(
     if target is None:
         return base
     chosen = route or (target.reach[0] if target.reach else ROUTE_DIRECT)
-    return {**base, "proxy_command": build_proxy_command(context, chosen, base)}
+    return {
+        **route_runtime(base, chosen),
+        "proxy_command": build_proxy_command(context, chosen, base),
+    }
 
 
 def ssh_option_parts(
@@ -2517,6 +2607,197 @@ def run_ssh_command(
         env=ssh_env(secret),
         capture_output=capture_output,
         timeout=timeout,
+    )
+
+
+def build_control_request(
+    secret: FleetSecret, control_path: str, request: str
+) -> list[str]:
+    """Build `ssh -O REQUEST` against CONTROL_PATH.
+
+    No transport prefix and no ProxyCommand: `-O` speaks to the local socket only,
+    so a password helper would have nothing to answer and the bridge has no part
+    in the question of whether the master is up.  The port and `user@host` are
+    still passed, because `%C` hashes them.
+    """
+    return [
+        "ssh",
+        "-O",
+        request,
+        "-p",
+        str(secret.port),
+        "-o",
+        f"ControlPath={control_path}",
+        secret.target,
+    ]
+
+
+def control_master_alive(secret: FleetSecret, runtime: dict[str, Any]) -> bool:
+    """Report whether RUNTIME's control socket has a live master behind it.
+
+    A socket file left behind by a killed master answers this honestly: `-O
+    check` connects to the socket instead of trusting that it exists.
+    """
+    control_path = runtime.get("control_path")
+    if not control_path:
+        return False
+    completed = run_command(
+        build_control_request(secret, str(control_path), "check"),
+        env=ssh_env(secret),
+        capture_output=True,
+        timeout=CONTROL_CHECK_TIMEOUT,
+    )
+    return completed.returncode == 0
+
+
+def open_control_master(
+    secret: FleetSecret, runtime: dict[str, Any], route: str
+) -> str | None:
+    """Bring up a background control master over ROUTE; return None on success.
+
+    `-N -f` backgrounds after authentication rather than before, so a key
+    passphrase or a 2FA prompt is still answerable -- BatchMode stays unset here
+    for the same reason it is unset everywhere else in this file, which is why
+    the subprocess deadline is generous while ConnectTimeout is not.
+    ControlMaster is left at `auto` rather than forced to `yes`, so two fleetctl
+    processes racing for one socket share the winner instead of the loser failing
+    with "ControlSocket already exists".
+    """
+    command = build_ssh_command(
+        secret,
+        allocate_tty=False,
+        remote_command=None,
+        **runtime,
+    )
+    # Inserted ahead of the secret's own ConnectTimeout, because OpenSSH keeps the
+    # first value it is given for an option.
+    insert_at = len(ssh_transport_prefix(secret)) + 1
+    command[insert_at:insert_at] = [
+        "-N",
+        "-f",
+        "-o",
+        f"ConnectTimeout={route_connect_timeout(route)}",
+    ]
+    completed = run_command(
+        command,
+        env=ssh_env(secret),
+        capture_output=True,
+        timeout=route_connect_timeout(route) + CONTROL_COMMAND_TIMEOUT,
+    )
+    if completed.returncode == 0:
+        return None
+    detail = (completed.stderr or "").strip().splitlines()
+    return detail[-1] if detail else f"ssh exited {completed.returncode}"
+
+
+def utc_timestamp() -> str:
+    """Return the current time as ISO-8601 UTC.
+
+    One spelling for every timestamp fleetctl records, so a state file written on
+    a laptop in one timezone still sorts against one written on a login node in
+    another.
+    """
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def route_state_file(paths: FleetPaths) -> Path:
+    """Where the route each target was last reached over is recorded."""
+    return paths.state_home / "routes.json"
+
+
+def read_route_state(paths: FleetPaths) -> dict[str, Any]:
+    """Read the route each target was last reached over, for reporting only.
+
+    Never consulted when choosing a route.  A cache that remembered the bridge
+    had worked would quietly pin every later command to it, which is the exact
+    opposite of preferring the direct path.
+    """
+    try:
+        loaded = json.loads(route_state_file(paths).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def record_route_state(
+    paths: FleetPaths, target: str, route: str, control_path: str
+) -> None:
+    """Record the route TARGET was just reached over.
+
+    Bookkeeping never breaks a connection: a state directory that cannot be
+    written costs a line of reporting, not the command that was about to run.
+    """
+    state = read_route_state(paths)
+    state[target] = {
+        "route": route,
+        "socket": control_path,
+        "at": utc_timestamp(),
+    }
+    try:
+        ensure_private_dir(paths.state_home, mode=STATE_DIR_MODE)
+        write_text_file(
+            route_state_file(paths),
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            mode=PRIVATE_FILE_MODE,
+        )
+    except OSError:
+        pass
+
+
+def ensure_route(plan: Plan) -> str:
+    """Bring up a control master for the first of PLAN's routes that works.
+
+    Selection happens once per socket, not once per command.  A warm master means
+    the route was chosen already and is still carrying traffic, so nothing is
+    re-probed and preferring the direct path costs nothing; when the socket is
+    cold each declared route is tried in order and the first master to come up
+    wins, which is what makes `reach` a fallback list rather than a wish.
+
+    Fallback lives here and nowhere else, deliberately.  Once a master exists a
+    failing command is a failing command -- never retried, never re-routed --
+    because `exec` and `submit` are at-most-once and a re-routed `sbatch` queues
+    the job twice.  A retry added anywhere outside this function takes that
+    guarantee away.
+    """
+    if plan._route is not None:
+        return plan._route
+    if not base_ssh_runtime_kwargs(plan.context)["control_path"]:
+        # Multiplexing is off, so there is no master to establish and no socket to
+        # check.  Fallback is a property of the master, not of the command.
+        return plan.route
+    secret = plan.secret
+    failures: list[str] = []
+    for route in plan.routes or DEFAULT_REACH:
+        runtime = ssh_runtime_kwargs(plan.context, target=plan.target, route=route)
+        failure = (
+            None
+            if control_master_alive(secret, runtime)
+            else open_control_master(secret, runtime, route)
+        )
+        if failure is None:
+            object.__setattr__(plan, "_route", route)
+            record_route_state(
+                plan.context.paths,
+                plan.target.name,
+                route,
+                str(runtime["control_path"]),
+            )
+            return route
+        failures.append(f"{route} ({failure})")
+    raise FleetError(
+        f"no route to {plan.target.name!r} came up; tried "
+        + ", ".join(failures)
+        + "."
+        + (
+            " Declare a `via:<bridge>` fallback in that target's `reach` if a "
+            "bridge can carry it."
+            if len(plan.target.reach) < 2
+            else ""
+        )
     )
 
 
@@ -4675,7 +4956,7 @@ def command_ssh(args: argparse.Namespace, context: FleetContext) -> int:
         plan.secret,
         allocate_tty=True,
         remote_command=None,
-        **plan.ssh_runtime(),
+        **plan.connect(),
     )
     return completed.returncode
 
@@ -4762,7 +5043,7 @@ def command_smoke(args: argparse.Namespace, context: FleetContext) -> int:
         remote_command=remote_shell_command(smoke_argv),
         capture_output=True,
         timeout=CONTROL_COMMAND_TIMEOUT,
-        **plan.ssh_runtime(),
+        **plan.connect(),
     )
     if completed.stdout:
         print(completed.stdout, end="")
@@ -4818,7 +5099,7 @@ def command_exec(args: argparse.Namespace, context: FleetContext) -> int:
         plan.secret,
         allocate_tty=bool(args.tty),
         remote_command=remote,
-        **plan.ssh_runtime(),
+        **plan.connect(),
     )
     return completed.returncode
 
@@ -4833,7 +5114,7 @@ def run_script_plan(
 ) -> int:
     """Stage LOCAL_SCRIPT on PLAN's target and run it there."""
     secret = plan.secret
-    ssh_runtime = plan.ssh_runtime()
+    ssh_runtime = plan.connect()
     remote_script = stage_remote_script(
         secret,
         plan.profile,
@@ -4884,7 +5165,7 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
     plan = build_plan(context, args, "sync")
     target = plan.target
     secret = plan.secret
-    ssh_runtime = plan.ssh_runtime()
+    ssh_runtime = plan.connect()
     default_remote = (
         resolve_remote_path(args.remote_path, base=plan.cwd)
         if args.remote_path
@@ -4978,7 +5259,9 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
     protocol = plan.protocol
     profile = plan.profile
     secret = plan.secret
-    ssh_runtime = plan.ssh_runtime()
+    # A dry run must not open a connection, so it describes the first route
+    # instead of establishing one; a real submit takes the route that comes up.
+    ssh_runtime = plan.ssh_runtime() if args.dry_run else plan.connect()
     cwd = plan.cwd
 
     # Two paths, and the profile itself says which: a profile submits if and only
@@ -5153,7 +5436,7 @@ def run_job_command(
         remote_command=remote_shell_command(argv, cwd=plan.cwd),
         capture_output=True,
         timeout=CONTROL_COMMAND_TIMEOUT,
-        **plan.ssh_runtime(),
+        **plan.connect(),
     )
     if completed.stdout:
         print(completed.stdout, end="")
@@ -5276,6 +5559,50 @@ def probe_remote_prerequisites(context: FleetContext) -> list[str]:
     return problems
 
 
+def probe_route_matrix(
+    context: FleetContext,
+) -> tuple[dict[str, dict[str, str]], list[str]]:
+    """Try every declared route of every target and report which ones carry.
+
+    "Direct is down, so you are on the bridge" should be something you are told
+    rather than a slowdown you eventually notice -- and a fallback that has
+    quietly become the only path is worth knowing before the bridge reboots.
+    Sockets this opens are left warm, which is most of the point of opening them.
+    """
+    matrix: dict[str, dict[str, str]] = {}
+    warnings: list[str] = []
+    for target in sorted(context.targets.values(), key=lambda item: item.name):
+        if not target.enabled:
+            continue
+        try:
+            secret = context.resolve_secret(target)
+        except FleetError:
+            continue  # already reported by the offline pass
+        results: dict[str, str] = {}
+        for route in target.reach or DEFAULT_REACH:
+            try:
+                runtime = ssh_runtime_kwargs(context, target=target, route=route)
+            except FleetError as exc:
+                results[route] = f"unusable: {exc}"
+                continue
+            if control_master_alive(secret, runtime):
+                results[route] = "live"
+                continue
+            failure = open_control_master(secret, runtime, route)
+            results[route] = "up" if failure is None else f"down: {failure}"
+        matrix[target.name] = results
+        working = [route for route, state in results.items() if state in ("live", "up")]
+        preferred = next(iter(results), None)
+        if not working:
+            warnings.append(f"no route to {target.name!r} came up")
+        elif preferred is not None and preferred not in working:
+            warnings.append(
+                f"{target.name!r} is reachable only over {working[0]!r}; its "
+                f"preferred route {preferred!r} is down"
+            )
+    return matrix, warnings
+
+
 def command_explain(args: argparse.Namespace, context: FleetContext) -> int:
     """Explain what a selector resolves to, and what each verb may do there.
 
@@ -5298,11 +5625,22 @@ def command_explain(args: argparse.Namespace, context: FleetContext) -> int:
         selector=selector,
         pool=context.pools.get(selector) if selector else None,
         admin=bool(args.admin),
-        routes=resolve_routes(target, getattr(args, "route", None)),
+        routes=resolve_routes(
+            target,
+            getattr(args, "route", None),
+            no_fallback=bool(getattr(args, "no_fallback", False)),
+        ),
     )
     role = resolve_role(target, protocol)
     payload = plan.describe()
     payload["ssh"] = shlex.join(plan.ssh_connect_argv())
+    payload["socket"] = plan.ssh_runtime().get("control_path")
+    # Reported, never consulted: this names the route that last worked, not the
+    # one the next command will take.
+    last_used = read_route_state(context.paths).get(target.name)
+    payload["route_last_used"] = (
+        last_used.get("route") if isinstance(last_used, dict) else None
+    )
     payload["queues"] = [queue.name for queue in protocol.queues]
     payload["admission"] = {
         verb: DECISION_LABELS[ROLE_MATRIX[role][VERBS.index(verb)]]
@@ -5327,6 +5665,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     )
     problems: list[str] = []
     warnings: list[str] = []
+    route_matrix: dict[str, dict[str, str]] = {}
 
     for required_dir in [
         paths.config_home,
@@ -5488,6 +5827,8 @@ def command_doctor(args: argparse.Namespace) -> int:
 
         if getattr(args, "probe", False):
             problems.extend(probe_remote_prerequisites(context))
+            route_matrix, route_warnings = probe_route_matrix(context)
+            warnings.extend(route_warnings)
 
     payload = {
         "config_home": str(paths.config_home),
@@ -5495,6 +5836,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         "pools": sorted(context.pools) if context else [],
         "protocols": sorted(context.protocols) if context else [],
         "profiles": sorted(context.profiles) if context else [],
+        "routes": route_matrix,
         "warnings": warnings,
         "problems": problems,
     }
@@ -5664,7 +6006,7 @@ NAME
 SYNOPSIS
     reach = ["direct"]
     reach = ["direct", "via:<bridge>"]
-    fleetctl <verb> <target> --route direct|via:<bridge>
+    fleetctl <verb> <target> [--route direct|via:<bridge>] [--no-fallback]
 
 DESCRIPTION
     How a host is reached is inventory, not a credential. `reach` is an
@@ -5673,10 +6015,11 @@ DESCRIPTION
     It defaults to ["direct"]. A repeated route is refused, and so is
     an empty list, which would mean nothing could ever reach the host.
 
-    The order is the point. Direct comes first and is the route taken;
-    a `via:` entry behind it is the declared fallback, because the one
-    machine that multiplexes every clustered connection is the last
-    thing you want in the path when you do not need it. `--route`
+    The order is the point. Direct comes first and is the route tried
+    first; a `via:` entry behind it is the fallback, taken only when
+    direct will not come up, because the one machine that multiplexes
+    every clustered connection is the last thing you want in the path
+    when you do not need it. `--route`
     selects a declared route and never invents one: a route fleetctl
     was never told about is a guess about someone else's network, and
     the failure it produces is a timeout rather than an error.
@@ -5695,15 +6038,32 @@ DESCRIPTION
     is still refused. A password-authenticated bridge is refused as a
     hop, because sshpass hands one password to the whole process tree.
 
-LIMITS
-    Nothing falls back on its own yet: the first declared route is the
-    one used, and a `via:` entry is a fallback you select. Both routes
-    to one host also share a control socket, because OpenSSH's %C hash
-    does not cover the ProxyCommand -- so a warm direct connection goes
-    on serving a `--route via:` command until it expires.
+FALLBACK
+    Selection happens once per control socket, not once per command. A
+    warm master means the route was chosen already and still carries
+    traffic, so nothing is re-probed; when the socket is cold each
+    route is tried in declared order and the first master to come up
+    wins. Direct gets a 5 second deadline and a bridge 10, so the whole
+    cost of preferring direct is one timeout per ControlPersist window,
+    paid only when direct is really down. `--no-fallback` refuses to
+    degrade.
 
-    `list --format topology` prints the graph: each target's routes,
-    and what each bridge carries.
+    Every route gets its own socket. OpenSSH's %C hash covers the host,
+    port and user but not the ProxyCommand, so without a suffix a warm
+    direct master would go on serving a `--route via:` command until it
+    expired. Setting an empty `control_path` turns multiplexing off,
+    and then there is no master to establish and the first route is the
+    only one.
+
+    Fallback lives in that one step and nowhere else. Once a master
+    exists a failing command is a failing command -- never retried,
+    never re-routed -- because `exec` and `submit` are at-most-once and
+    a re-routed `sbatch` would queue the job twice.
+
+    `explain` names the route chain, the socket and the route last
+    used; `doctor --probe` tries every route of every target and prints
+    the matrix. `list --format topology` prints the graph: each
+    target's routes, and what each bridge carries.
 
 DEPRECATED
     The secret key `proxy_jump` is accepted and ignored. Declare
@@ -5974,6 +6334,11 @@ def add_route_flag(parser: argparse.ArgumentParser) -> None:
         "--route",
         metavar="ROUTE",
         help='Use one declared route: "direct" or "via:<bridge>"',
+    )
+    parser.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help="Refuse to degrade to a later route when the first one is down",
     )
 
 
