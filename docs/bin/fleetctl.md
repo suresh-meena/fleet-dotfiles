@@ -29,7 +29,7 @@ accident.
 | path | holds |
 | --- | --- |
 | `~/.config/fleet/` | `targets.d/` `pools.d/` `protocols.d/` `profiles.d/` `secrets/` `config.toml` `projects.toml` |
-| `~/.local/state/fleet/` | private `known_hosts`, `routes.json`, `jobs.jsonl`, `audit.jsonl` |
+| `~/.local/state/fleet/` | private `known_hosts`, `routes.json`, `jobs.jsonl`, `audit.jsonl`, probed `facts/` |
 | `~/.cache/fleet/mux/` | SSH control sockets |
 
 `$FLEET_CONFIG_HOME`, `$FLEET_STATE_HOME` and `$FLEET_CACHE_HOME` move all
@@ -144,6 +144,16 @@ takes the smallest sufficient candidate (fewest GPUs, then VRAM, CPUs, memory,
 then by name) and an ambiguous match without `--fit` is refused rather than
 guessed.
 
+Declared values are authoritative and nothing measured ever selects anything.
+`fleetctl probe <target>` records what a host reports — `nvidia-smi`, `lscpu`,
+`free`, `python3`, and `sinfo` for the queues at a scheduler site — into
+`<state-home>/facts/<target>.json` at `0600`, and the only thing that reads it
+is `doctor`, which reports the difference. Measuring short of a declaration is a
+problem, since a box with less than it promised accepts a job sized for the
+promise and then fails it; measuring over it is a warning that the declaration
+is stale. The machine being described is the one supplying the description, which
+is why it never gets a vote.
+
 On a Slurm site the hardware belongs to the partition, so a queue carries its
 own `[queue.capabilities]`. Those layer over the target's, `--require` filters
 the partitions, and `--fit` picks the smallest sufficient one. `--gpus` and
@@ -158,11 +168,15 @@ fleetctl import-ssh <alias> --name <target> --role workstation
 fleetctl doctor            # must be clean before anything else
 fleetctl doctor --probe    # also checks remote python3, which exec needs
                           # (a host out of reach is a warning, not a problem)
+fleetctl probe <target>    # measure one host; doctor then reports the drift
 ```
 
 `migrate-config` rewrites an older inventory in place: it fills in `role`, makes
-`protocol` explicit, and lifts a secret's `proxy_jump` into `reach` with
-`direct` in front of it.
+`protocol` explicit, lifts a secret's `proxy_jump` into `reach` with `direct` in
+front of it, and strips the keys nothing reads any more — `transport`,
+`ssh_host_alias`, `metadata`, `job_runtime` and a pool's `strategy`. Those stay
+*accepted* so an unmigrated inventory still loads, and `doctor` names every file
+still carrying one.
 
 ## Daily
 
@@ -175,6 +189,33 @@ fleetctl submit train.sh --target <target> --queue <preset>
 fleetctl jobs                                      # what you have submitted
 fleetctl job status <id>                           # target from the ledger
 ```
+
+One question, whole fleet:
+
+```bash
+fleetctl smoke --all --jobs 4
+fleetctl exec --tag gpu --jobs 4 -- nvidia-smi -L
+fleetctl job status <id> --all
+```
+
+Sequential without `--jobs`. Each host's output is prefixed with its name and
+held until every host has answered, then one line per target says `ok`,
+`failed`, `refused` or `plan`; exit is 2 if anything was refused, otherwise the
+first non-zero remote code by target name.
+
+Only `smoke`, `exec` and `job status` fan out. `sync`, `submit`, `script`,
+`ssh`, `probe` and `job logs|cancel` refuse by name and say why: they write, or
+they mean something different at each site, and partial failure across a fleet
+leaves a state nothing afterwards can report. A fanned-out `sbatch` is a
+fanned-out double submission.
+
+Concurrency is capped at four per reach-hop rather than globally — a bridge
+multiplexes every connection through one small machine, and ClusterShell's
+default fan-out of 64 is a number for a homogeneous LAN. A target that declares
+a `via:` fallback counts against that bridge even when direct is up; `--route
+direct --no-fallback` narrows the route list and gets the full `--jobs` back.
+Anything left out of the run — a disabled host, a cap, a target that would not
+resolve — is printed as a `note:` rather than passed over.
 
 `--dry-run` prints the fully resolved plan and exits 0, claiming nothing about
 remote state — except for `sync`, where it runs `rsync --dry-run
@@ -216,7 +257,14 @@ trip that creates the next one.
 `host`, `user`, `port`, `auth`, `identity_file`, `password` and the SSH tuning
 knobs live in a secret, never in a target file — putting one in a target is a
 refusal with that explanation. Three backends: a private TOML file, a `pass`
-entry, or an inline table. Resolution is lazy.
+entry, an inline table, or a command fleetctl runs. Resolution is lazy.
+
+`secret_backend = "command"` runs `secret_ref` and reads the same TOML off its
+stdout, merged over the target's inline `[secret]` table — for the field that
+will not hold still, such as a cloud box whose address changes on every start.
+Cached 30 seconds in memory only, never on disk. Its stdout is a secret: it is
+redacted like any other, and a failing upcall is a refusal naming the command
+and its stderr rather than a half-resolved connection.
 
 ```bash
 fleetctl show <target> --secret               # host and user both redacted

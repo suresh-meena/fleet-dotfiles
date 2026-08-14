@@ -22,10 +22,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from pathlib import Path
+from typing import Any, Callable, Iterable
 
 VERSION = "0.1.0"
 PRIVATE_DIR_MODE = 0o700
@@ -355,7 +358,6 @@ class TargetRecord:
 
     name: str
     enabled: bool = True
-    transport: str = "ssh"
     role: str | None = None
     protocol: str | None = None
     reach: tuple[str, ...] = DEFAULT_REACH
@@ -365,9 +367,8 @@ class TargetRecord:
     secret_ref: str | None = None
     secret_inline: dict[str, Any] = field(default_factory=dict)
     capabilities: dict[str, Any] = field(default_factory=dict)
-    ssh_host_alias: str | None = None
+    # Read by resolve_profile, between the project binding and the protocol.
     default_profile: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -428,7 +429,6 @@ class ProtocolRecord:
     description: str | None = None
     default_profile: str | None = None
     gpu_request_mode: str = "gres"
-    job_runtime: str = "host"
     native_batch_required: bool = False
     job_output_dir: str = ".fleet/jobs"
     docs: tuple[str, ...] = ()
@@ -977,6 +977,18 @@ class FleetContext:
             return load_toml_file(path), path
         if target.secret_backend == "pass":
             return parse_secret_blob(run_pass_show(target.secret_ref)), None
+        if target.secret_backend == "command":
+            # Merged over the inline table rather than replacing it, because the
+            # point is to supply *a field*.  Everything stable about the host
+            # stays written down in the target's `[secret]`, and the upcall
+            # answers only the question that has a different answer today.
+            values = dict(target.secret_inline)
+            values.update(
+                run_secret_command(
+                    target.secret_ref, what=f"target {target.name!r}"
+                )
+            )
+            return values, None
         raise FleetError(
             f"target {target.name!r} uses unsupported secret backend "
             f"{target.secret_backend!r}"
@@ -1240,6 +1252,199 @@ def parse_capabilities(
     return capabilities
 
 
+# ---- SECTION: probed facts (advisory, never authoritative) ------------------
+#
+# `probe` measures a host and writes down what it found.  Nothing in resolution
+# reads it, and that is the whole design rather than an omission: this is Salt's
+# grains-versus-pillars split, where minion-supplied grains are documented as
+# "less secure than other identifiers" precisely because the machine being
+# described is the one supplying the description.  A declared capability is a
+# commitment its owner made; a probed one is a reading taken over the connection
+# whose trustworthiness is the thing in question.  So admission and selection
+# read declarations only, and a fact file that says a box has eight GPUs cannot
+# route a job to it.
+#
+# What the facts are for is the other half of the idea, and Slurm has the shape
+# worth copying: a node found short of its configured GRES is DRAINed, not
+# logged.  A machine with less than it promised will accept a job sized for the
+# promise and then fail it, so `doctor` reports a shortfall as a fault.  Drift
+# the other way -- more than declared -- is a stale declaration, which is a
+# warning: nothing breaks, but `--fit` is choosing on old numbers.
+
+PROBE_FACT_KEYS = ("arch", "gpu_model", *FIT_ORDER)
+
+# How far a measurement may fall short of a declaration before it counts.  `free`
+# never reports the nominal size (the kernel, reserved regions and the
+# framebuffer come off the top) and `nvidia-smi` reports usable VRAM rather than
+# the number on the box.  With no slack every honestly-declared machine in the
+# fleet would be permanently faulty, which is how a check gets ignored.
+PROBE_DRIFT_TOLERANCE: dict[str, float] = {"mem_gb": 0.10, "vram_gb": 0.05}
+
+
+def probe_facts_file(paths: FleetPaths, target: str) -> Path:
+    """Where one target's measured facts are cached."""
+    return paths.state_home / "facts" / f"{target}.json"
+
+
+def read_probed_facts(paths: FleetPaths, target: str) -> dict[str, Any]:
+    """Read TARGET's last probe, for reporting only.
+
+    An unreadable or absent file is "not probed yet", never an error: the facts
+    are advisory, so `doctor` must not start failing because a state directory
+    went away.
+    """
+    try:
+        loaded = json.loads(probe_facts_file(paths, target).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def write_probed_facts(
+    paths: FleetPaths, target: str, facts: dict[str, Any]
+) -> Path:
+    """Record TARGET's measured facts, 0600 under the state home.
+
+    Measured facts name hardware and, through `queues`, a site's partitions, so
+    they get the same handling as the rest of the state directory rather than
+    landing world-readable in a cache.
+    """
+    path = probe_facts_file(paths, target)
+    ensure_private_dir(path.parent, mode=STATE_DIR_MODE)
+    write_text_file(
+        path, json.dumps(facts, indent=2, sort_keys=True) + "\n", mode=PRIVATE_FILE_MODE
+    )
+    return path
+
+
+def parse_probe_output(text: str) -> dict[str, Any]:
+    """Turn the probe script's `key=value` lines into facts.
+
+    The numeric keys are coerced exactly as `[capabilities]` coerces them, so a
+    measured `mem_gb` and a declared one are comparable without inventing a
+    second vocabulary.  A line whose value will not parse as a number where a
+    number belongs is dropped rather than stored as text: a fact that cannot be
+    compared is not a fact, and storing it would put `mem_gb = "unknown"` in a
+    file `doctor` reads.
+    """
+    facts: dict[str, Any] = {}
+    for line in text.splitlines():
+        key, separator, value = line.strip().partition("=")
+        key, value = key.strip(), value.strip()
+        if not separator or not key or not value:
+            continue
+        if key in CAPABILITY_NUMBER_KEYS:
+            number = capability_number(value)
+            if number is None:
+                continue
+            facts[key] = int(number) if number.is_integer() else number
+        else:
+            facts[key] = value
+    return facts
+
+
+def capability_drift(
+    declared: dict[str, Any], measured: dict[str, Any]
+) -> list[tuple[str, str]]:
+    """Compare a declaration against a measurement, key by key.
+
+    Only the intersection is compared, in both directions deliberately.  A key
+    measured but not declared is not drift -- the declaration is the contract,
+    and a fleet is not obliged to declare everything a tool can report.  A key
+    declared but not measured is not drift either: `nvidia-smi` missing means the
+    probe could not see, which is different from seeing zero.
+    """
+    drift: list[tuple[str, str]] = []
+    for key in sorted(set(declared) & set(measured)):
+        want, have = declared[key], measured[key]
+        want_number = capability_number(want)
+        have_number = capability_number(have)
+        if want_number is not None and have_number is not None:
+            slack = PROBE_DRIFT_TOLERANCE.get(key, 0.0) * abs(want_number)
+            if have_number < want_number - slack:
+                drift.append(
+                    (
+                        "short",
+                        f"declares {key} = {capability_text(want)} but measured "
+                        f"{capability_text(have)}, so a job sized for the "
+                        "declaration will be accepted and then fail",
+                    )
+                )
+            elif have_number > want_number + slack:
+                drift.append(
+                    (
+                        "stale",
+                        f"declares {key} = {capability_text(want)} but measured "
+                        f"{capability_text(have)}; `--fit` is choosing on the "
+                        "smaller number",
+                    )
+                )
+            continue
+        if capability_text(want) != capability_text(have):
+            drift.append(
+                (
+                    "stale",
+                    f"declares {key} = {capability_text(want)!r} but measured "
+                    f"{capability_text(have)!r}",
+                )
+            )
+    return drift
+
+
+def probe_remote_argv(plan: Plan) -> list[str]:
+    """The one remote script `probe` runs.
+
+    Read-only by construction, and every tool behind `command -v`, so a host with
+    no `nvidia-smi` reports no GPU instead of failing the probe.  `set -u` without
+    `-e` for the same reason: one absent tool must not end the measurement.
+
+    The numbers are normalised on the remote side into the keys `[capabilities]`
+    already uses, because drift is only computable where the two vocabularies
+    meet -- a probe reporting `MemTotal` in kB would produce a fact nothing could
+    compare against a declared `mem_gb`.
+    """
+    body = (
+        "set -u;"
+        " printf 'arch=%s\\n' \"$(uname -m)\";"
+        " printf 'kernel=%s\\n' \"$(uname -sr)\";"
+        " if command -v python3 >/dev/null 2>&1; then"
+        " printf 'python3=%s\\n' \"$(python3 --version 2>&1)\";"
+        " fi;"
+        " if command -v nproc >/dev/null 2>&1; then"
+        " printf 'cpus=%s\\n' \"$(nproc)\";"
+        " elif command -v getconf >/dev/null 2>&1; then"
+        " printf 'cpus=%s\\n' \"$(getconf _NPROCESSORS_ONLN)\";"
+        " fi;"
+        " if command -v free >/dev/null 2>&1; then"
+        " printf 'mem_gb=%s\\n'"
+        " \"$(free -m | awk '/^Mem:/ {printf \"%d\", ($2 + 512) / 1024}')\";"
+        " fi;"
+        " if command -v nvidia-smi >/dev/null 2>&1; then"
+        " cards=\"$(nvidia-smi --query-gpu=name,memory.total"
+        " --format=csv,noheader,nounits)\";"
+        " printf 'gpu_count=%s\\n' \"$(printf '%s\\n' \"$cards\" | grep -c .)\";"
+        " printf 'gpu_model=%s\\n'"
+        " \"$(printf '%s\\n' \"$cards\" | head -n1 | cut -d, -f1)\";"
+        # The smallest card, not the first: a mixed box can only really run a job
+        # that fits on whichever GPU it lands on.
+        " printf 'vram_gb=%s\\n' \"$(printf '%s\\n' \"$cards\" | cut -d, -f2"
+        " | sort -n | head -n1 | awk '{printf \"%d\", ($1 + 512) / 1024}')\";"
+        " fi;"
+    )
+    if plan.protocol.kind == "slurm":
+        # The partitions are the selectable surface at a scheduler site, so they
+        # are the fact worth measuring there.  The login node's own CPUs are not
+        # what anything runs on, and reporting them as the target's would be a
+        # measurement that contradicts the whole queue model.
+        body += (
+            " if command -v sinfo >/dev/null 2>&1; then"
+            " printf 'queues=%s\\n' \"$(sinfo -h -o '%P' | tr -d ' *' | sort -u"
+            " | paste -sd, -)\";"
+            " fi;"
+        )
+    return ["/usr/bin/env", "bash", "-lc", body]
+
+
 # ---- SECTION: resolution (config + args -> Plan, no remote I/O) ------------
 
 
@@ -1444,8 +1649,11 @@ def build_plan(context: FleetContext, args: argparse.Namespace, verb: str) -> Pl
 
     The role matrix is consulted here rather than in each handler, so a new verb
     cannot forget it: there is no way to obtain a Plan without passing admission
-    first, and no way to act on a host without a Plan.
+    first, and no way to act on a host without a Plan.  Fan-out is refused in the
+    same place and for the same reason -- a verb that writes must not acquire N
+    plans, and the check cannot be forgotten if there is nowhere else to put it.
     """
+    ensure_fanout_supported(args)
     selector = context.normalize_selector(getattr(args, "selector", None))
     requirements = parse_requirements(getattr(args, "require", None) or ())
     fit = bool(getattr(args, "fit", False))
@@ -1589,6 +1797,330 @@ def load_repo_template(path: str, fallback: str) -> str:
     return template_path.read_text(encoding="utf-8")
 
 
+# ---- SECTION: fan-out ------------------------------------------------------
+#
+# One command over many hosts, with two bounds that are not optional.
+#
+# The first is concurrency, and it is per reach-hop rather than global.
+# ClusterShell defaults to a fanout of 64, which is the right number for what it
+# was built for: a homogeneous LAN cluster where every node is one hop away.
+# This fleet is the other shape.  Every clustered connection can be multiplexed
+# through a Raspberry Pi, and 64 simultaneous ssh masters through a Pi is not a
+# fan-out, it is an outage -- while a fleet-wide cap of 4 would throttle the
+# directly-reachable boxes for a bottleneck they do not share.  So the limit
+# belongs to the hop, not to the run.
+#
+# The second is which verbs may do it at all, and the answer is: the ones where
+# half-finishing is recoverable.  `smoke`, `exec` and `job status` read and
+# report, so a fan-out that dies four hosts in has cost four reports.  `sync` and
+# `submit` write, and partial failure across a fleet is how fleets get hurt --
+# some hosts on the new code and some on the old, with nothing afterwards able to
+# say which; a fanned-out `sbatch` is a fanned-out double submission.  There is
+# no flag for it, because the flag would be used.
+#
+# Whatever narrows the set gets said out loud.  A silent truncation reads as
+# "covered everything" when it did not, which is worse than a refusal: the
+# operator moves on believing the fleet is consistent.
+
+FANOUT_COMMANDS = ("smoke", "exec", "job status")
+
+# Per hop, and roughly rather than exactly 4: the number that matters is "a
+# handful", set by what a Pi's CPU can do with four concurrent AES streams, and
+# any precision here would be false.
+FANOUT_HOP_LIMIT = 4
+
+FANOUT_REFUSALS: dict[str, str] = {
+    "sync": (
+        "a partial transfer leaves some hosts on the new code and some on the "
+        "old, and nothing afterwards can tell you which is which. Sync one "
+        "target at a time and let the first failure stop you"
+    ),
+    "submit": (
+        "a fanned-out `sbatch` is a fanned-out double submission -- N "
+        "allocations for one job, and a rerun that looks exactly like the first "
+        "attempt. Submit per target, and let each job id come back"
+    ),
+    "script": (
+        "staging a script is a write, and a stage that succeeded on four hosts "
+        "and failed on the fifth is not a state anything reports later"
+    ),
+    "ssh": "an interactive session is one terminal, and this would want N",
+    "probe": (
+        "the facts it writes are per host and per connection, so they are worth "
+        "having only when you can attribute them. `doctor` already reads every "
+        "fact file the fleet has"
+    ),
+    "job logs": (
+        "a scheduler job id means nothing off the site that issued it, so this "
+        "would fetch a different job's logs from each host -- interleaved"
+    ),
+    "job cancel": (
+        "the same id names a different job at every site, so a fanned-out "
+        "cancel cancels other people's work. Name the target that ran it"
+    ),
+}
+
+
+@dataclass(frozen=True)
+class FanoutResult:
+    """What one target did, kept whole until every target is done."""
+
+    name: str
+    status: str
+    detail: str
+    code: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+def command_label(args: argparse.Namespace) -> str:
+    """The subcommand as a human writes it: `job status`, not `status`."""
+    parts = [str(getattr(args, "command", "") or "")]
+    nested = getattr(args, "job_command", None)
+    if nested:
+        parts.append(str(nested))
+    return " ".join(part for part in parts if part)
+
+
+def fanout_requested(args: argparse.Namespace) -> bool:
+    """True when `--all` or `--tag` asked for more than one target."""
+    return bool(getattr(args, "all_targets", False)) or bool(
+        optional_str(getattr(args, "tag", None))
+    )
+
+
+def ensure_fanout_supported(args: argparse.Namespace) -> None:
+    """Refuse a fan-out the verb cannot survive half-finishing.
+
+    Called from build_plan rather than from the handlers, for the same reason
+    admission is: there is exactly one way to reach a host, so a verb cannot
+    forget to check, and a verb added later inherits the refusal by default.
+    """
+    if not fanout_requested(args):
+        return
+    label = command_label(args)
+    if label in FANOUT_COMMANDS:
+        return
+    reason = FANOUT_REFUSALS.get(
+        label, "only read-only, idempotent verbs may run against many hosts"
+    )
+    raise FleetError(
+        f"`fleetctl {label}` does not fan out: {reason}. Fan-out is limited to "
+        + ", ".join(f"`{item}`" for item in FANOUT_COMMANDS)
+        + " -- read-only, idempotent, and safe to have half-finish."
+    )
+
+
+def fanout_targets(
+    context: FleetContext, args: argparse.Namespace
+) -> tuple[list[str], list[str]]:
+    """Which targets a fan-out covers, and every way the set got smaller."""
+    selector = optional_str(getattr(args, "selector", None)) or optional_str(
+        getattr(args, "selector_override", None)
+    )
+    if selector:
+        raise FleetError(
+            f"{selector!r} names one target and --all/--tag name many; pick one. "
+            "A pool already selects, so it resolves to a single host rather than "
+            "fanning out -- use `--tag` for the set a pool would collapse."
+        )
+    tag = optional_str(getattr(args, "tag", None))
+    notes: list[str] = []
+    names: list[str] = []
+    skipped: list[str] = []
+    for target in sorted(context.targets.values(), key=lambda item: item.name):
+        if tag and tag not in target.tags:
+            continue
+        if not target.enabled:
+            skipped.append(target.name)
+            continue
+        names.append(target.name)
+    if skipped:
+        notes.append(
+            "not covered, disabled in the inventory: " + ", ".join(skipped)
+        )
+    if not names:
+        raise FleetError(
+            f"no enabled target carries the tag {tag!r}"
+            if tag
+            else "the fleet has no enabled targets"
+        )
+    return names, notes
+
+
+def fanout_hop(routes: Iterable[str]) -> str:
+    """The hop that bounds concurrency for a target with these routes.
+
+    The first declared bridge, if there is one -- not the route the connection
+    will probably take.  A `reach` of `["direct", "via:numpi"]` is a statement
+    that the Pi may end up carrying this connection, and direct is down for all
+    of them about as often as it is down for one, so a cap that only holds while
+    nothing falls back is not a cap.  `--route direct --no-fallback` narrows the
+    route list to one entry and gets the full `--jobs` back, which is the honest
+    way to ask for it: it says out loud that a bridged host is now out of scope.
+    """
+    for route in routes:
+        if route.startswith(ROUTE_VIA_PREFIX):
+            return route
+    return ROUTE_DIRECT
+
+
+def fanout_hop_limit(hop: str, jobs: int) -> int:
+    """How many connections HOP carries at once, given `--jobs`."""
+    if hop == ROUTE_DIRECT:
+        return max(1, jobs)
+    return max(1, min(jobs, FANOUT_HOP_LIMIT))
+
+
+def fanout_execute(
+    items: list[tuple[str, str]],
+    *,
+    jobs: int,
+    work: Callable[[str], tuple[int, str, str]],
+) -> list[tuple[str, tuple[int, str, str]]]:
+    """Run WORK over ITEMS -- `(hop, key)` pairs -- and return one result each.
+
+    Two bounds, composed: `jobs` workers in total, and a semaphore per hop
+    holding that hop to fanout_hop_limit.  Each task takes exactly one semaphore,
+    so there is no lock order to get wrong.  Results come back in ITEMS order
+    however the threads finished, because a report whose line order depends on
+    which host answered first is a report you cannot diff against yesterday's.
+    """
+    limits: dict[str, threading.Semaphore] = {}
+    for hop, _ in items:
+        if hop not in limits:
+            limits[hop] = threading.Semaphore(fanout_hop_limit(hop, jobs))
+    ordered = [key for _, key in items]
+    if jobs <= 1 or len(items) <= 1:
+        # Sequential by default, and genuinely sequential: no pool, so a
+        # single-target run has the same stack as it did before this existed.
+        return [(key, work(key)) for key in ordered]
+
+    def guarded(hop: str, key: str) -> tuple[int, str, str]:
+        with limits[hop]:
+            return work(key)
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {key: pool.submit(guarded, hop, key) for hop, key in items}
+    return [(key, futures[key].result()) for key in ordered]
+
+
+def fanout_detail(text: str) -> str:
+    """Collapse a message to one line, for a report that is one line per host."""
+    return " ".join(str(text).split())
+
+
+def fanout_exit_code(results: Iterable["FanoutResult"]) -> int:
+    """The one status a fan-out reports.
+
+    A refusal outranks a remote failure: exit 2 means the policy layer stopped
+    something, and that stays true when nine of ten hosts also happened to fail.
+    Otherwise the first non-zero remote code in name order, so the status is
+    reproducible rather than a race between hosts.
+    """
+    ordered = sorted(results, key=lambda item: item.name)
+    if any(result.status == "refused" for result in ordered):
+        return 2
+    for result in ordered:
+        if result.code:
+            return result.code
+    return 0
+
+
+def report_fanout(results: list["FanoutResult"], notes: Iterable[str]) -> int:
+    """Print one fan-out: remote output first, then one line per target.
+
+    Every remote line is prefixed with the host it came from.  Unprefixed output
+    from four machines interleaved is not a report -- there is no way to tell
+    which of them has no GPU.  Notes go to stderr so that piping the summary
+    somewhere does not silently drop the part that says what was left out.
+    """
+    ordered = sorted(results, key=lambda item: item.name)
+    for result in ordered:
+        for line in result.stdout.splitlines():
+            print(f"{result.name}: {line}")
+        for line in result.stderr.splitlines():
+            print(f"{result.name}: {line}", file=sys.stderr)
+    width = max((len(result.name) for result in ordered), default=0)
+    for result in ordered:
+        row = f"{result.name.ljust(width)}  {result.status.ljust(8)}{result.detail}"
+        print(row.rstrip())
+    for note in notes:
+        print(f"note: {note}", file=sys.stderr)
+    return fanout_exit_code(ordered)
+
+
+def fanout_run(
+    context: FleetContext,
+    args: argparse.Namespace,
+    *,
+    verb: str,
+    work: Callable[[Plan], tuple[int, str, str]],
+) -> int:
+    """Resolve every target in the fan-out, then run WORK against each.
+
+    Resolution happens for all of them before any of them runs, so an admission
+    refusal or an unresolvable target is reported next to the successes instead
+    of aborting the fleet -- and so the report does not depend on the alphabet.
+    """
+    names, notes = fanout_targets(context, args)
+    jobs = max(1, int(getattr(args, "jobs", 1) or 1))
+    results: list[FanoutResult] = []
+    plans: list[tuple[str, Plan]] = []
+    for name in names:
+        one = argparse.Namespace(**vars(args))
+        one.selector = name
+        one.all_targets = False
+        one.tag = None
+        try:
+            plans.append((name, build_plan(context, one, verb)))
+        except FleetError as error:
+            results.append(
+                FanoutResult(name, "refused", fanout_detail(error), 2)
+            )
+    items = [(fanout_hop(plan.routes), name) for name, plan in plans]
+    # Reported before the dry-run branch, not after: a plan that does not mention
+    # the cap it will hit is the kind of dry-run that reads as a promise.
+    for hop in sorted({hop for hop, _ in items if hop != ROUTE_DIRECT}):
+        carried = sum(1 for existing, _ in items if existing == hop)
+        limit = fanout_hop_limit(hop, jobs)
+        if carried > limit:
+            notes.append(
+                f"{carried} targets may be reached over {hop}, so at most "
+                f"{limit} of them run at once"
+            )
+    if getattr(args, "dry_run", False):
+        # `plan.route` is the first candidate until something connects, which is
+        # exactly what makes it printable here: nothing has been reached yet.
+        results.extend(
+            FanoutResult(name, "plan", f"{verb} over {plan.route}", 0)
+            for name, plan in plans
+        )
+        return report_fanout(results, notes)
+    by_name = dict(plans)
+
+    def guarded(name: str) -> tuple[int, str, str]:
+        try:
+            return work(by_name[name])
+        except FleetError as error:
+            # One host's failure is one line of the report.  Letting it out here
+            # would abandon the results already collected from the others.
+            return error.exit_code, "", f"{error}\n"
+
+    for name, (code, out, err) in fanout_execute(items, jobs=jobs, work=guarded):
+        results.append(
+            FanoutResult(
+                name,
+                "ok" if code == 0 else "failed",
+                "" if code == 0 else f"exit {code}",
+                code,
+                out,
+                err,
+            )
+        )
+    return report_fanout(results, notes)
+
+
 # ---- SECTION: config schema ------------------------------------------------
 #
 # Every key fleetctl understands is listed here, and anything else in a config
@@ -1617,7 +2149,6 @@ TARGET_KEYS = frozenset(
         "version",
         "name",
         "enabled",
-        "transport",
         "role",
         "protocol",
         "reach",
@@ -1627,12 +2158,10 @@ TARGET_KEYS = frozenset(
         "secret_ref",
         "secret",
         "capabilities",
-        "ssh_host_alias",
         "default_profile",
-        "metadata",
     }
 )
-POOL_KEYS = frozenset({"version", "name", "targets", "match_tags", "strategy"})
+POOL_KEYS = frozenset({"version", "name", "targets", "match_tags"})
 PROTOCOL_KEYS = frozenset(
     {
         "version",
@@ -1641,7 +2170,6 @@ PROTOCOL_KEYS = frozenset(
         "description",
         "default_profile",
         "gpu_request_mode",
-        "job_runtime",
         "native_batch_required",
         "job_output_dir",
         "docs",
@@ -1715,9 +2243,11 @@ SECRET_KEYS = frozenset(
     }
 )
 
-TRANSPORTS = ("ssh",)
-SECRET_BACKENDS = ("file", "pass", "inline")
-POOL_STRATEGIES = ("ordered",)
+# `command` runs `secret_ref` and reads TOML off its stdout.  It exists for the
+# field that will not hold still -- a cloud box whose address changes on every
+# start -- and it keeps that knowledge in a script the operator already has
+# rather than making fleetctl learn one provider's API and then the next one's.
+SECRET_BACKENDS = ("file", "pass", "inline", "command")
 PROTOCOL_KINDS = ("direct", "slurm")
 GPU_REQUEST_MODES = ("none", "gpus", "gres")
 AUTH_MODES = ("key", "password")
@@ -1731,6 +2261,22 @@ STRICT_HOST_KEY_MODES = ("yes", "no", "off", "ask", "accept-new")
 # so it is written down here rather than hidden as a stray entry in a key set.
 DEPRECATED_TARGET_KEYS: dict[str, str] = {
     "scheduler": "what may run here is decided by `role`; `protocol` is required",
+    "transport": (
+        "there was one value, `ssh`, and nothing ever branched on it. A second "
+        "transport would have to change how commands, copies and control sockets "
+        "are built, none of which a key in a target file could reach"
+    ),
+    "ssh_host_alias": (
+        "it never reached an ssh invocation, and could not: a fleet connection is "
+        "built from the secret and deliberately ignores `~/.ssh/config`, which is "
+        "what `IdentitiesOnly` and a private `known_hosts` are for. A real `Host` "
+        "alias is expressible as `[ssh_option]` in the secret"
+    ),
+    "metadata": (
+        "a free-form table nothing read. The two things people put in it are "
+        "already modelled by something that acts on them: `tags` to group hosts, "
+        "`[capabilities]` to describe the hardware"
+    ),
 }
 DEPRECATED_PROTOCOL_KEYS: dict[str, str] = {
     "scheduler_required": "the role matrix decides this for every verb",
@@ -1740,8 +2286,21 @@ DEPRECATED_PROTOCOL_KEYS: dict[str, str] = {
         'protocol shared by all of them; declare `gpu_count` under the target\'s '
         "`[capabilities]` and `smoke` follows it"
     ),
+    "job_runtime": (
+        "nothing ever read it, and a second runtime dimension is the wrong shape "
+        "anyway: how work is invoked belongs to the profile that invokes it, so a "
+        'container is an `interpreter` or a `submit_command` beginning '
+        '["apptainer", "exec", ...] -- one place, and one that `--dry-run` prints'
+    ),
 }
 DEPRECATED_POOL_KEYS: dict[str, str] = {
+    "strategy": (
+        "`ordered` was the only value left. The one it replaced, `random`, was "
+        "re-rolled on every call, so `sync push` landed the code on one member "
+        "and the `submit` after it queued the job on another. Selection takes the "
+        "first enabled member, and `--require`/`--fit` are how you ask for a "
+        "different one -- repeatably, and for a stated reason"
+    ),
     "default_profile": (
         "profile resolution never saw the pool, so this was unreachable; set it "
         "on the target, the protocol, or the project binding"
@@ -1958,13 +2517,6 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
         target = TargetRecord(
             name=name,
             enabled=bool(raw.get("enabled", True)),
-            transport=check_vocabulary(
-                str(raw.get("transport", "ssh")),
-                TRANSPORTS,
-                what=what,
-                key="transport",
-                source=source,
-            ),
             role=(
                 check_vocabulary(
                     str(raw["role"]), ROLES, what=what, key="role", source=source
@@ -1994,11 +2546,7 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
                 what=f"`[capabilities]` for {what}",
                 source=source,
             ),
-            ssh_host_alias=optional_str(raw.get("ssh_host_alias")),
             default_profile=optional_str(raw.get("default_profile")),
-            metadata=check_table(
-                raw.get("metadata", {}), what=f"`metadata` for {what}", source=source
-            ),
         )
         targets[target.name] = target
     return targets
@@ -2021,13 +2569,6 @@ def load_pools(path: Path) -> dict[str, PoolRecord]:
             name=name,
             targets=tuple(str(item) for item in raw.get("targets", [])),
             match_tags=tuple(str(item) for item in raw.get("match_tags", [])),
-            strategy=check_vocabulary(
-                str(raw.get("strategy", "ordered")),
-                POOL_STRATEGIES,
-                what=what,
-                key="strategy",
-                source=source,
-            ),
         )
         if not pool.targets and not pool.match_tags:
             # `select_pool` treats "no members declared" as "every target",
@@ -2051,7 +2592,6 @@ def built_in_protocols() -> dict[str, ProtocolRecord]:
         description="Direct SSH execution on a host-level workdir.",
         default_profile="plain-ssh",
         gpu_request_mode="gres",
-        job_runtime="host",
         native_batch_required=False,
     )
     slurm = ProtocolRecord(
@@ -2060,7 +2600,6 @@ def built_in_protocols() -> dict[str, ProtocolRecord]:
         description="Scheduler-backed login surface that submits compute via Slurm.",
         default_profile="slurm-batch",
         gpu_request_mode="gres",
-        job_runtime="host",
         native_batch_required=False,
     )
     return {
@@ -2161,7 +2700,6 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
                 key="gpu_request_mode",
                 source=source,
             ),
-            job_runtime=str(raw.get("job_runtime", "host")),
             native_batch_required=bool(raw.get("native_batch_required", False)),
             job_output_dir=str(raw.get("job_output_dir", ".fleet/jobs")),
             docs=doc_values,
@@ -2411,7 +2949,10 @@ def parse_secret_dict(raw: dict[str, Any], *, source: Path | None = None) -> Fle
 
 
 def parse_secret_blob(text: str) -> dict[str, Any]:
-    """Parse multi-line secret material from `pass show`."""
+    """Parse multi-line secret material from an upcall.
+
+    Shared by the `pass` and `command` backends, so the error names neither.
+    """
     stripped = text.lstrip()
     if "=" in stripped:
         try:
@@ -2419,7 +2960,7 @@ def parse_secret_blob(text: str) -> dict[str, Any]:
         except tomllib.TOMLDecodeError as exc:
             raise FleetError(f"invalid TOML secret material: {exc}") from exc
     raise FleetError(
-        "pass secret material must be TOML with keys like `host`, `user`, and `port`"
+        "secret material must be TOML with keys like `host`, `user`, and `port`"
     )
 
 
@@ -2754,6 +3295,80 @@ def swap_config_tree(staging: Path, live: Path) -> Path | None:
             os.replace(previous, live)
         raise
     return previous if rotated else None
+
+SECRET_COMMAND_TIMEOUT = 30.0
+
+# How long one resolved upcall is reused.  ClusterShell caches its external group
+# sources too, but for an hour by default; this is far shorter because what is
+# cached is the address of a machine that moves, and a stale address is a
+# connection to whoever holds that address now.  It only has to cover the window
+# where two resolutions of one target must agree -- `sync push` and the `submit`
+# after it -- and it is deliberately not long enough to survive a coffee break.
+SECRET_COMMAND_TTL = 30.0
+
+# In-process only, and deliberately not a file under the state home.  A disk
+# cache of resolved secret material would be a second secret store with none of
+# the handling the first one gets, and the window that needs covering is one
+# command, not one week.  Locked because a fan-out resolves several targets at
+# once and they may share an upcall.
+_SECRET_COMMAND_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_SECRET_COMMAND_LOCK = threading.Lock()
+
+
+def run_secret_command(command: str, *, what: str) -> dict[str, Any]:
+    """Run one secret upcall and parse its output, cached for the TTL.
+
+    The whole point is to resolve a churning cloud address at connect time
+    without teaching fleetctl a cloud API: the command knows, fleetctl asks.
+
+    Its stdout is a secret, which is why the failure path reports stderr and
+    never stdout.  `run_pass_show` can fall back to printing stdout because
+    `pass` writes diagnostics there when it fails; an upcall that exits non-zero
+    has already put the first half of a credential there instead.  A failure is a
+    FleetError naming the command that failed -- never a partial secret handed on
+    to the connection layer, which would resolve to a target nobody chose.
+    """
+    argv = shlex.split(command)
+    if not argv:
+        raise FleetError(
+            f"`secret_ref` for {what} is empty, but the `command` backend reads "
+            "it as the command to run"
+        )
+    with _SECRET_COMMAND_LOCK:
+        cached = _SECRET_COMMAND_CACHE.get(command)
+        if cached is not None and cached[0] > time.monotonic():
+            return dict(cached[1])
+    try:
+        completed = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=SECRET_COMMAND_TIMEOUT,
+        )
+    except FileNotFoundError as exc:
+        raise FleetError(
+            f"secret command for {what} cannot be run: {argv[0]!r} not found"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise FleetError(
+            f"secret command for {what} timed out after "
+            f"{SECRET_COMMAND_TIMEOUT:g}s: {shlex.join(argv)}"
+        ) from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        raise FleetError(
+            f"secret command for {what} exited {completed.returncode}: "
+            + (detail[-1] if detail else "nothing on stderr to explain it")
+        )
+    values = parse_secret_blob(completed.stdout)
+    with _SECRET_COMMAND_LOCK:
+        _SECRET_COMMAND_CACHE[command] = (
+            time.monotonic() + SECRET_COMMAND_TTL,
+            dict(values),
+        )
+    return values
+
 
 def run_pass_show(secret_ref: str) -> str:
     """Fetch one pass entry."""
@@ -4320,7 +4935,6 @@ def target_display(
     """Render one target for table or JSON output."""
     return {
         "name": target.name,
-        "transport": target.transport,
         "protocol": protocol_name,
         "reach": list(target.reach),
         "workdir": target.workdir or "",
@@ -4343,7 +4957,6 @@ def protocol_display(protocol: ProtocolRecord) -> dict[str, Any]:
         "default_profile": protocol.default_profile or "",
         "default_queue": default_queue.name if default_queue is not None else "",
         "gpu_request_mode": protocol.gpu_request_mode,
-        "job_runtime": protocol.job_runtime,
         "native_batch_required": protocol.native_batch_required,
         "job_output_dir": protocol.job_output_dir,
         "docs": list(protocol.docs),
@@ -4650,7 +5263,6 @@ def local_target_template(name: str) -> str:
 version = 1
 name = "{name}"
 enabled = true
-transport = "ssh"
 protocol = "direct"
 # Ordered, and tried in order: direct first, a bridge as the fallback.
 # `["direct", "via:<bridge>"]` suits a host that is only sometimes dialable.
@@ -4691,7 +5303,6 @@ def pool_template(name: str) -> str:
     return f"""\
 version = 1
 name = "{name}"
-strategy = "ordered"
 targets = ["target-name"]
 """
 
@@ -4760,51 +5371,6 @@ def infer_secret_from_ssh_alias(alias: str) -> tuple[FleetSecret, str | None]:
         strict_host_key_checking=optional_str(raw.get("stricthostkeychecking")),
     )
     return secret, proxy_jump
-
-
-def parse_env_file(path: Path) -> dict[str, str]:
-    """Parse simple KEY=VALUE env files with shell quoting."""
-    values: dict[str, str] = {}
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :].lstrip()
-        key, separator, value = line.partition("=")
-        if not separator:
-            raise FleetError(f"invalid env line {line_number} in {path}: {raw_line!r}")
-        parsed = shlex.split(value, posix=True)
-        if len(parsed) > 1:
-            raise FleetError(
-                f"env value for {key.strip()} on line {line_number} must parse to one token"
-            )
-        values[key.strip()] = parsed[0] if parsed else ""
-    return values
-
-
-def normalize_machine_name(name: str) -> str:
-    """Normalize a machine name for env-style prefixes."""
-    return name.upper().replace("-", "_").replace(".", "_")
-
-
-def machine_field(env: dict[str, str], prefix: str, machine: str, field: str) -> str | None:
-    """Return one imported env field."""
-    return env.get(f"{prefix}_{normalize_machine_name(machine)}_{field}")
-
-
-def configured_machine_names(env: dict[str, str], prefix: str) -> list[str]:
-    """Enumerate machine names from one env-based remote schema."""
-    configured = env.get(f"{prefix}_MACHINES", "")
-    if configured:
-        return [item.strip() for item in configured.split(",") if item.strip()]
-    suffix = "_HOST"
-    stem = f"{prefix}_"
-    names = []
-    for key in sorted(env):
-        if key.startswith(stem) and key.endswith(suffix):
-            names.append(key[len(stem) : -len(suffix)].lower())
-    return names
 
 
 TOML_ESCAPES = {
@@ -4883,7 +5449,6 @@ def target_to_toml(target: TargetRecord) -> str:
         "version = 1",
         f"name = {toml_string(target.name)}",
         f"enabled = {'true' if target.enabled else 'false'}",
-        f"transport = {toml_string(target.transport)}",
     ]
     if target.role:
         lines.append(f"role = {toml_string(target.role)}")
@@ -4900,8 +5465,6 @@ def target_to_toml(target: TargetRecord) -> str:
     lines.append(f"secret_backend = {toml_string(target.secret_backend)}")
     if target.secret_ref:
         lines.append(f"secret_ref = {toml_string(target.secret_ref)}")
-    if target.ssh_host_alias:
-        lines.append(f"ssh_host_alias = {toml_string(target.ssh_host_alias)}")
     if target.default_profile:
         lines.append(f"default_profile = {toml_string(target.default_profile)}")
     if target.capabilities:
@@ -5272,7 +5835,6 @@ def command_list(args: argparse.Namespace, context: FleetContext) -> int:
         [
             "name",
             "enabled",
-            "transport",
             "role",
             "protocol",
             "default_profile",
@@ -5320,7 +5882,6 @@ def command_show(args: argparse.Namespace, context: FleetContext) -> int:
             "name": pool.name,
             "targets": list(pool.targets),
             "match_tags": list(pool.match_tags),
-            "strategy": pool.strategy,
             "members": [member.name for member in context.pool_members(pool)],
             "resolved_target": resolved.name,
             "resolved_protocol": context.resolve_protocol(resolved).name,
@@ -5461,111 +6022,6 @@ def command_import_ssh(args: argparse.Namespace, context: FleetContext) -> int:
     return 0
 
 
-def command_migrate_env(args: argparse.Namespace, context: FleetContext) -> int:
-    """Import env-based remote config into private fleet state."""
-    ensure_private_dir(context.paths.config_home, mode=PRIVATE_DIR_MODE)
-    ensure_private_dir(context.paths.targets_dir, mode=PRIVATE_DIR_MODE)
-    ensure_private_dir(context.paths.secrets_dir, mode=PRIVATE_DIR_MODE)
-    ensure_private_dir(context.paths.profiles_dir, mode=PRIVATE_DIR_MODE)
-    write_text_if_missing(
-        context.paths.profiles_dir / "plain-ssh.toml",
-        default_plain_profile_template(),
-        mode=PRIVATE_FILE_MODE,
-    )
-
-    env = parse_env_file(args.env_file)
-    prefix = args.prefix
-    names = configured_machine_names(env, prefix)
-    if not names:
-        raise FleetError(
-            f"no machines found in {args.env_file}; expected keys like "
-            f"{prefix}_MACHINES or {prefix}_<MACHINE>_HOST"
-        )
-
-    imported: list[str] = []
-    target_roots: dict[str, str] = {}
-    project_path = (
-        expand_local_path(args.project_path)
-        if args.project_path
-        else args.env_file.resolve().parent
-    )
-    project_name = project_path.name
-    for machine in names:
-        secret_path = context.paths.secrets_dir / f"{machine}.toml"
-        target_path = context.paths.targets_dir / f"{machine}.toml"
-        if not args.force and (secret_path.exists() or target_path.exists()):
-            raise FleetError(
-                f"target {machine!r} already exists; rerun with --force to overwrite"
-            )
-        secret = FleetSecret(
-            host=required_env_field(env, prefix, machine, "HOST"),
-            user=required_env_field(env, prefix, machine, "USER"),
-            port=int(machine_field(env, prefix, machine, "PORT") or "22"),
-            auth=(machine_field(env, prefix, machine, "AUTH") or "key").lower(),
-            identity_file=optional_str(machine_field(env, prefix, machine, "SSH_KEY")),
-            password=optional_str(machine_field(env, prefix, machine, "PASSWORD")),
-            connect_timeout=int(args.connect_timeout),
-            server_alive_interval=int(args.server_alive_interval),
-            server_alive_count_max=int(args.server_alive_count_max),
-        )
-        remote_root = optional_str(machine_field(env, prefix, machine, "WORKDIR"))
-        inferred_workdir = None
-        if remote_root:
-            remote_root_path = PurePosixPath(remote_root)
-            if remote_root_path.name == project_name:
-                inferred_workdir = str(remote_root_path.parent)
-        target = TargetRecord(
-            name=machine,
-            role=args.role,
-            protocol=args.protocol or "direct",
-            workdir=inferred_workdir,
-            tags=tuple(args.tag),
-            secret_backend="file",
-            secret_ref=str(secret_path),
-            default_profile=args.profile or "plain-ssh",
-        )
-        write_text_file(target_path, target_to_toml(target), mode=PRIVATE_FILE_MODE)
-        write_text_file(secret_path, secret_to_toml(secret), mode=PRIVATE_FILE_MODE)
-        if remote_root and not inferred_workdir:
-            target_roots[machine] = remote_root
-        imported.append(machine)
-
-    default_machine = optional_str(env.get(f"{prefix}_DEFAULT_MACHINE"))
-    existing = next(
-        (item for item in context.projects if item.path == project_path),
-        None,
-    )
-    update_project_binding(
-        context.paths.projects_file,
-        project_path=project_path,
-        target=default_machine or (existing.default_target if existing else None),
-        pool=existing.default_pool if existing else None,
-        profile=args.profile or (
-            existing.default_profile if existing else "plain-ssh"
-        ),
-        remote_root=existing.remote_root if existing else None,
-        remote_roots_by_target={
-            **(existing.remote_roots_by_target if existing else {}),
-            **target_roots,
-        },
-        sync_excludes=existing.sync_excludes if existing else (),
-    )
-
-    for machine in imported:
-        print(machine)
-    return 0
-
-
-def required_env_field(env: dict[str, str], prefix: str, machine: str, field: str) -> str:
-    """Require one imported env field."""
-    value = machine_field(env, prefix, machine, field)
-    if value is None or value == "":
-        raise FleetError(
-            f"missing required field {prefix}_{normalize_machine_name(machine)}_{field}"
-        )
-    return value
-
-
 def command_seed_pass(args: argparse.Namespace, context: FleetContext) -> int:
     """Seed pass entries from the current live fleet config."""
     prefix = args.pass_prefix.strip("/")
@@ -5618,20 +6074,11 @@ def command_seed_pass(args: argparse.Namespace, context: FleetContext) -> int:
         secret_entry = pass_entry_name(prefix, "secrets", target.name)
         run_pass_insert(secret_entry, secret_to_toml(secret), force=args.force)
         written.append(secret_entry)
-        rendered_target = TargetRecord(
-            name=target.name,
-            enabled=target.enabled,
-            transport=target.transport,
-            role=target.role,
-            protocol=target.protocol,
-            workdir=target.workdir,
-            tags=target.tags,
+        rendered_target = replace(
+            target,
             secret_backend="pass",
             secret_ref=secret_entry,
             secret_inline={},
-            ssh_host_alias=target.ssh_host_alias,
-            default_profile=target.default_profile,
-            metadata=target.metadata,
         )
         target_entry = pass_entry_name(prefix, "targets", target.name)
         run_pass_insert(target_entry, target_to_toml(rendered_target), force=args.force)
@@ -5654,7 +6101,6 @@ def pool_to_toml(pool: PoolRecord) -> str:
     if pool.match_tags:
         tags = ", ".join(toml_string(tag) for tag in pool.match_tags)
         lines.append(f"match_tags = [{tags}]")
-    lines.append(f"strategy = {toml_string(pool.strategy)}")
     return "\n".join(lines) + "\n"
 
 
@@ -5828,12 +6274,7 @@ def command_migrate_config(args: argparse.Namespace) -> int:
                 if role == "login"
                 else f"protocol {protocol.name!r} runs work directly"
             )
-        # target_to_toml() cannot express these, so a rewrite would drop them.
-        if target.metadata:
-            blockers.append(
-                f"{name}: defines `metadata`, which fleetctl does not read and this "
-                "rewrite would silently drop; delete it by hand first"
-            )
+        # target_to_toml() cannot express this, so a rewrite would drop it.
         if target.secret_inline:
             blockers.append(
                 f"{name}: keeps its connection details in an inline `[secret]` table, "
@@ -5898,6 +6339,8 @@ def command_migrate_config(args: argparse.Namespace) -> int:
             # change list, which is what decides whether the swap happens at all.
             original = source.read_text(encoding="utf-8") if source else ""
             _, dead = strip_top_level_keys(original, DEPRECATED_TARGET_KEYS)
+            if strip_toml_table(original, "metadata")[1]:
+                dead = [*dead, "metadata"]
             for key in dead:
                 changes.append(f"targets.d/{new_name}.toml: dropped `{key}`")
             comments = sum(1 for line in original.splitlines() if line.strip().startswith("#"))
@@ -6197,9 +6640,32 @@ def command_ssh(args: argparse.Namespace, context: FleetContext) -> int:
 
 
 def command_smoke(args: argparse.Namespace, context: FleetContext) -> int:
-    """Run a lightweight connectivity check."""
+    """Run a lightweight connectivity check, on one host or across a fan-out."""
+    if fanout_requested(args):
+        return fanout_run(context, args, verb="ssh", work=smoke_one)
     # `smoke` only reports on the host, so it rides the same rule as `ssh`.
     plan = build_plan(context, args, "ssh")
+    code, out, err = smoke_one(plan)
+    if out:
+        print(out, end="")
+    if err:
+        print(err, end="", file=sys.stderr)
+    if code != 0:
+        raise FleetError(
+            f"smoke check failed for {plan.target.name!r} with exit code {code}",
+            exit_code=code,
+        )
+    return 0
+
+
+def smoke_one(plan: Plan) -> tuple[int, str, str]:
+    """Run the smoke script against PLAN and hand back what it printed.
+
+    Split out of the handler so a fan-out can hold N of these until every host
+    has answered.  Returning the output instead of printing it is the whole
+    difference: four hosts writing to one terminal at once is not a report.
+    """
+    # `smoke` only reports on the host, so it rides the same rule as `ssh`.
     target = plan.target
     protocol = plan.protocol
     workdir = target.workdir
@@ -6280,16 +6746,7 @@ def command_smoke(args: argparse.Namespace, context: FleetContext) -> int:
         timeout=CONTROL_COMMAND_TIMEOUT,
         **plan.connect(),
     )
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    if completed.returncode != 0:
-        raise FleetError(
-            f"smoke check failed for {target.name!r} with exit code {completed.returncode}",
-            exit_code=completed.returncode,
-        )
-    return 0
+    return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
 def command_exec(args: argparse.Namespace, context: FleetContext) -> int:
@@ -6309,6 +6766,15 @@ def command_exec(args: argparse.Namespace, context: FleetContext) -> int:
             "`fleetctl exec` requires a command after `--`, as in "
             "`fleetctl exec rtx1 -- nvidia-smi`"
         )
+    if fanout_requested(args):
+        # No TTY across a fan-out, and none is offered: N pseudo-terminals
+        # sharing one keyboard is not something to allocate by accident.
+        return fanout_run(
+            context,
+            args,
+            verb="exec",
+            work=lambda plan: exec_one(plan, argv),
+        )
     plan = build_plan(context, args, "exec")
     environment = dict(plan.profile.environment)
     if args.dry_run:
@@ -6317,26 +6783,42 @@ def command_exec(args: argparse.Namespace, context: FleetContext) -> int:
             args,
             {"remote_command": shlex.join(argv), "environment": environment or None},
         )
+    completed = run_ssh_command(
+        plan.secret,
+        allocate_tty=bool(args.tty),
+        remote_command=exec_remote_command(plan, argv),
+        **plan.connect(),
+    )
+    return completed.returncode
+
+
+def exec_remote_command(plan: Plan, argv: list[str]) -> str:
+    """Build the remote invocation `exec` sends: ARGV, uninterpreted."""
     encoded_stub = base64.b64encode(EXEC_REMOTE_STUB.encode("utf-8")).decode("ascii")
     payload = base64.b64encode(
         json.dumps(
             {
                 "argv": argv,
-                "env": environment,
+                "env": dict(plan.profile.environment),
             }
         ).encode("utf-8")
     ).decode("ascii")
-    remote = remote_shell_command(
+    return remote_shell_command(
         ["python3", "-c", EXEC_REMOTE_BOOTSTRAP, encoded_stub, payload],
         cwd=plan.cwd,
     )
+
+
+def exec_one(plan: Plan, argv: list[str]) -> tuple[int, str, str]:
+    """Run ARGV against PLAN and hand back what it printed, for a fan-out."""
     completed = run_ssh_command(
         plan.secret,
-        allocate_tty=bool(args.tty),
-        remote_command=remote,
+        allocate_tty=False,
+        remote_command=exec_remote_command(plan, argv),
+        capture_output=True,
         **plan.connect(),
     )
-    return completed.returncode
+    return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
 def run_script_plan(
@@ -6717,6 +7199,22 @@ def run_job_command(
         raise FleetError(
             f"profile {plan.profile.name!r} does not support this job operation"
         )
+    code, out, err = job_command_output(plan, template, job_id=job_id)
+    if out:
+        print(out, end="")
+    if err:
+        print(err, end="", file=sys.stderr)
+    return code
+
+
+def job_command_output(
+    plan: Plan, template: tuple[str, ...], *, job_id: str
+) -> tuple[int, str, str]:
+    """Run one scheduler command and hand back what it printed."""
+    if not template:
+        raise FleetError(
+            f"profile {plan.profile.name!r} does not support this job operation"
+        )
     argv = render_template_values(template, job_id=job_id, workdir=plan.cwd)
     completed = run_ssh_command(
         plan.secret,
@@ -6726,15 +7224,29 @@ def run_job_command(
         timeout=CONTROL_COMMAND_TIMEOUT,
         **plan.connect(),
     )
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    return completed.returncode
+    return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
 def command_job_status(args: argparse.Namespace, context: FleetContext) -> int:
-    """Check remote scheduler status."""
+    """Check remote scheduler status, on one host or across a fan-out.
+
+    The one `job` operation that fans out: it reads, and asking six sites where
+    a job is is a question with six independent answers.  `logs` and `cancel`
+    refuse, because a scheduler id means nothing off the site that issued it.
+
+    A fan-out does not consult the ledger.  `--all` and `--tag` name the set
+    outright, and filling a target in from a past submission would quietly
+    shrink that set to one.
+    """
+    if fanout_requested(args):
+        return fanout_run(
+            context,
+            args,
+            verb="job",
+            work=lambda plan: job_command_output(
+                plan, plan.profile.status_command, job_id=args.job_id
+            ),
+        )
     apply_job_ledger_defaults(args, context)
     plan = build_plan(context, args, "job")
     return run_job_command(plan, plan.profile.status_command, job_id=args.job_id)
@@ -6799,6 +7311,55 @@ def toml_syntax_problems(paths: FleetPaths) -> list[str]:
         except OSError as exc:
             problems.append(f"cannot read {candidate}: {exc}")
     return problems
+
+
+def command_probe(args: argparse.Namespace, context: FleetContext) -> int:
+    """Measure one target and record what it reported.
+
+    Admitted as `ssh`, deliberately not as a verb of its own: it reads and
+    reports, exactly like `smoke`, and a seventh column in the role matrix would
+    be a seventh thing every role needs an opinion about when the opinion here is
+    already "may I look at this host".
+    """
+    plan = build_plan(context, args, "ssh")
+    completed = run_ssh_command(
+        plan.secret,
+        allocate_tty=False,
+        remote_command=remote_shell_command(probe_remote_argv(plan)),
+        capture_output=True,
+        timeout=CONTROL_COMMAND_TIMEOUT,
+        **plan.connect(),
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        raise FleetError(
+            f"probe of {plan.target.name!r} failed with exit code "
+            f"{completed.returncode}: "
+            + (detail[-1] if detail else "no diagnostic on stderr"),
+            exit_code=completed.returncode,
+        )
+    observed = parse_probe_output(completed.stdout)
+    measured = {key: observed[key] for key in PROBE_FACT_KEYS if key in observed}
+    facts = {
+        "target": plan.target.name,
+        "probed_at": utc_timestamp(),
+        "route": plan.route,
+        "capabilities": measured,
+        "observed": {
+            key: value for key, value in observed.items() if key not in measured
+        },
+    }
+    path = write_probed_facts(context.paths, plan.target.name, facts)
+    payload = dict(facts)
+    payload["facts_file"] = str(path)
+    payload["drift"] = [detail for _, detail in capability_drift(
+        plan.target.capabilities, measured
+    )]
+    emit(payload, as_json=bool(args.json))
+    # Zero even when the measurement contradicts the declaration.  `probe`
+    # records; `doctor` decides whether a contradiction is a fault, because
+    # `doctor` is the command whose exit status people already gate on.
+    return 0
 
 
 def probe_remote_prerequisites(
@@ -7126,6 +7687,26 @@ def command_doctor(args: argparse.Namespace) -> int:
                     f"target {target.name!r}", target.capabilities
                 )
             )
+            # Drift between what a target declares and what `probe` last
+            # measured.  Reported here rather than acted on anywhere: the
+            # declaration stays authoritative, and this is the only thing the
+            # measurement is for.
+            facts = read_probed_facts(paths, target.name)
+            measured = facts.get("capabilities")
+            if isinstance(measured, dict):
+                for severity, detail in capability_drift(
+                    target.capabilities, measured
+                ):
+                    line = (
+                        f"target {target.name!r} {detail} "
+                        f"[probed {facts.get('probed_at') or 'at an unknown time'}]"
+                    )
+                    if severity == "short":
+                        # Slurm DRAINs a node found short of its configured GRES
+                        # instead of logging it and carrying on scheduling.
+                        problems.append(line)
+                    else:
+                        warnings.append(line)
             for queue in protocol.queues:
                 warnings.extend(
                     capability_key_warnings(
@@ -7276,6 +7857,7 @@ NAME
 
 SYNOPSIS
     fleetctl <verb> [<target>|<pool>] [--admin] [--route <route>]
+    fleetctl <verb> --all|--tag <tag> [--jobs <n>]
     fleetctl exec <target> [--tty] [--dry-run] -- <argv>...
     fleetctl script <file> --target <target> [--interpreter <cmd>]
     fleetctl sync push|pull <local> [<remote>] [--delete] [--force]
@@ -7286,12 +7868,37 @@ ADMISSION VERBS
 
 {VERB_TABLE}
 
-    `smoke` is not one of them: it only reports on the host, so it is
-    admitted as `ssh`. Nine subcommands open a connection and so carry
-    --admin and --route together -- ssh, smoke, exec, script, sync,
-    submit, and the three `job` operations. `explain` takes both too,
-    so you can ask what an --admin run or a chosen route would do
-    without doing it.
+    `smoke` and `probe` are not among them: both only report on the
+    host, so both are admitted as `ssh`. Ten subcommands open a
+    connection and so carry --admin and --route together -- ssh, smoke,
+    probe, exec, script, sync, submit, and the three `job` operations.
+    `explain` takes both too, so you can ask what an --admin run or a
+    chosen route would do without doing it.
+
+FAN-OUT
+    --all covers every enabled target, --tag every enabled target
+    carrying one tag, and --jobs runs up to N at once. Sequential by
+    default. Each host's output is prefixed with its name and held until
+    every host has answered, then one line per target reports ok,
+    failed, refused or plan.
+
+    Only smoke, exec and job status fan out. sync, submit, script, ssh,
+    probe, job logs and job cancel refuse by name: they write, or they
+    mean something different at each site, and partial failure across a
+    fleet leaves a state nothing afterwards can report. A fanned-out
+    `sbatch` is a fanned-out double submission.
+
+    Concurrency is capped per reach-hop at {FANOUT_HOP_LIMIT}, not
+    globally: a bridge multiplexes every connection through one small
+    machine, while direct hosts share no such bottleneck. A target that
+    declares a `via:` fallback counts against that bridge even when
+    direct is up, because a cap that only holds while nothing falls back
+    is not a cap; `--route direct --no-fallback` narrows the route list
+    and gets the full --jobs back.
+
+    Anything left out is said out loud -- a disabled host, a cap, a
+    target that would not resolve. Exit status is 2 if anything was
+    refused, otherwise the first non-zero remote code by target name.
 
     Those same nine append one line to
     $FLEET_STATE_HOME/audit.jsonl: the time, the subcommand, the
@@ -7304,9 +7911,9 @@ ADMISSION VERBS
 EVERYTHING ELSE
     Inventory   jobs, list, show, explain, resolve, protocol show,
                 queue list, project bind|show|list
-    Setup       init, import-ssh, migrate-config, migrate-env
+    Setup       init, import-ssh, migrate-config
     Secrets     seed-pass, deploy-config
-    Diagnosis   doctor, help
+    Diagnosis   doctor, probe, help
 
     --json is on the inspection and diagnostic subcommands only. A verb
     that runs remote work prints what the remote printed.
@@ -7559,9 +8166,27 @@ PREFLIGHT
     units are scheduler-specific, and a wrong parse would refuse a
     valid job.
 
-    Declared values are authoritative and nothing is measured. What a
-    machine has is a fact its owner writes down, not something probed
-    at selection time and already stale.
+MEASUREMENT
+    Declared values are authoritative. What a machine has is a fact its
+    owner writes down, not something probed at selection time and
+    already stale, and nothing here ever reads a measurement.
+
+    `fleetctl probe <target>` measures one host -- nvidia-smi, lscpu,
+    free, python3, and sinfo for the queues at a scheduler site -- and
+    writes it to `<state-home>/facts/<target>.json`, 0600. Those facts
+    exist for exactly one purpose: `doctor` compares them against the
+    declaration and reports the difference. They cannot select a host,
+    admit a verb or satisfy a --require, and the split is deliberate:
+    the machine being described is the one supplying the description.
+
+    Measuring short of the declaration is a problem, not a warning. A
+    box with less than it promised accepts a job sized for the promise
+    and then fails it -- the same reason Slurm DRAINs a node found
+    short of its configured GRES. Measuring over it is a warning: the
+    declaration is stale and --fit is choosing on old numbers. Memory
+    and VRAM carry a tolerance, because `free` never reports the
+    nominal size and a check that flags every honest machine gets
+    ignored.
 
 SEE ALSO
     fleetctl help roles, fleetctl help jobs, fleetctl help config
@@ -7575,6 +8200,7 @@ SYNOPSIS
         config.toml  projects.toml
         targets.d/  pools.d/  protocols.d/  profiles.d/  secrets/
     $FLEET_STATE_HOME   known_hosts  routes.json  jobs.jsonl  audit.jsonl
+                        facts/
     $FLEET_CACHE_HOME   mux/  (ssh control sockets)
 
 DESCRIPTION
@@ -7619,7 +8245,7 @@ NAME
     fleetctl secrets - connection material, kept out of the inventory
 
 SYNOPSIS
-    secret_backend = "file" | "pass" | "inline"
+    secret_backend = "file" | "pass" | "inline" | "command"
     secret_ref = "<config-home>/secrets/<target>.toml"
     fleetctl show <target> --secret [--sensitive]
 
@@ -7635,9 +8261,28 @@ DESCRIPTION
     entry becomes one `-o key=value`, which is the escape hatch for
     everything fleetctl does not model.
 
-    Three backends: a private TOML file, a `pass` entry, or a
-    `secret = { ... }` table inline in the target. Resolution is lazy,
-    on first use, so only the code that opens a connection pays for it.
+    Four backends: a private TOML file, a `pass` entry, a
+    `secret = { ... }` table inline in the target, or a command.
+    Resolution is lazy, on first use, so only the code that opens a
+    connection pays for it.
+
+    `secret_backend = "command"` runs `secret_ref` and reads the same
+    TOML off its stdout, merged over the target's inline `[secret]`
+    table. It is for the field that will not hold still -- a cloud box
+    whose address changes on every start -- so the address is resolved
+    at connect time by a script that already knows, rather than by
+    teaching fleetctl one provider's API and then the next one's. The
+    result is cached for 30 seconds, which covers a `sync push` and the
+    `submit` after it and not much else; a stale address is a
+    connection to whoever holds that address now. The cache is in
+    memory only, because a resolved secret on disk would be a second
+    secret store with none of the handling the first one gets.
+
+    Its stdout is a secret and is treated as one: redacted by `show`
+    like any other, and never quoted in an error. A failing upcall is a
+    refusal naming the command and its stderr -- never a partial secret
+    passed on to the connection layer, which would resolve to a host
+    nobody chose.
 
     A `host`, `user`, `port`, `password` or `identity_file` key in a
     target file is refused with that explanation, not a spelling hint:
@@ -7769,6 +8414,15 @@ DESCRIPTION
         fleetctl doctor
         fleetctl doctor --probe
 
+    Ask the whole fleet one read-only question, four at a time:
+        fleetctl smoke --all --jobs 4
+        fleetctl exec --tag gpu --jobs 4 -- nvidia-smi -L
+
+    Measure a host, then have doctor report what disagrees with the
+    inventory:
+        fleetctl probe <target>
+        fleetctl doctor
+
     Pick a machine by what it has rather than by name, smallest
     sufficient one first:
         fleetctl list --format capabilities
@@ -7832,6 +8486,10 @@ def render_manual(topic: str) -> str:
         .replace("{VERB_TABLE}", render_verb_table())
         .replace("{TOPIC_LIST}", "  ".join(MANUAL_TOPICS))
         .replace("{FIT_KEYS}", ", ".join(FIT_ORDER))
+        # Substituted rather than written out, for the same reason the role table
+        # is: a manual that states the cap independently of the cap is a manual
+        # that will one day be wrong.
+        .replace("{FANOUT_HOP_LIMIT}", str(FANOUT_HOP_LIMIT))
         .rstrip()
     )
 
@@ -7902,6 +8560,36 @@ def add_connection_flags(parser: argparse.ArgumentParser) -> None:
     add_route_flag(parser)
     add_capability_flags(parser)
     parser.set_defaults(audited=True)
+    add_fanout_flags(parser)
+
+
+def add_fanout_flags(parser: argparse.ArgumentParser) -> None:
+    """Register `--all`, `--tag` and `--jobs` on a verb that opens a connection.
+
+    Including the verbs that refuse to fan out, which is the point: argparse's
+    "unrecognized arguments: --all" explains nothing, and every other refusal in
+    this tool names the reason and the alternative.
+    """
+    parser.add_argument(
+        "--all",
+        dest="all_targets",
+        action="store_true",
+        help="Run against every enabled target (read-only verbs only)",
+    )
+    parser.add_argument(
+        "--tag",
+        help="Run against every enabled target carrying one tag",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Run up to N targets at once; sequential by default, and never more "
+            f"than {FANOUT_HOP_LIMIT} through any one bridge"
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -8195,67 +8883,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_ssh_parser.set_defaults(handler=command_import_ssh)
 
-    migrate_env_parser = subparsers.add_parser(
-        "migrate-env",
-        help="Import env-based remote config into private fleet state",
-    )
-    migrate_env_parser.add_argument(
-        "--env-file",
-        type=Path,
-        required=True,
-        help="Path to the env file that currently holds remote config",
-    )
-    migrate_env_parser.add_argument(
-        "--prefix",
-        required=True,
-        help="Env variable prefix, without trailing underscore",
-    )
-    migrate_env_parser.add_argument(
-        "--tag",
-        action="append",
-        default=[],
-        help="Tag to attach to imported targets",
-    )
-    migrate_env_parser.add_argument(
-        "--profile",
-        default="plain-ssh",
-        help="Default profile to assign to imported targets",
-    )
-    migrate_env_parser.add_argument(
-        "--protocol",
-        help="Protocol name to attach to imported targets",
-    )
-    migrate_env_parser.add_argument(
-        "--role",
-        choices=ROLES,
-        help="Role to assign to every imported machine",
-    )
-    migrate_env_parser.add_argument(
-        "--project-path",
-        help="Project path for the generated local project binding",
-    )
-    migrate_env_parser.add_argument(
-        "--connect-timeout",
-        default=30,
-        help="Default connect timeout to store in imported secrets",
-    )
-    migrate_env_parser.add_argument(
-        "--server-alive-interval",
-        default=30,
-        help="Default ServerAliveInterval to store in imported secrets",
-    )
-    migrate_env_parser.add_argument(
-        "--server-alive-count-max",
-        default=3,
-        help="Default ServerAliveCountMax to store in imported secrets",
-    )
-    migrate_env_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite existing targets and secrets",
-    )
-    migrate_env_parser.set_defaults(handler=command_migrate_env)
-
     ssh_parser = subparsers.add_parser("ssh", help="Open an interactive SSH session")
     ssh_parser.add_argument("selector", nargs="?", help="Target or pool name")
     add_connection_flags(ssh_parser)
@@ -8267,6 +8894,17 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_parser.add_argument("--cwd", help="Remote working directory override")
     add_connection_flags(smoke_parser)
     smoke_parser.set_defaults(handler=command_smoke)
+
+    probe_parser = subparsers.add_parser(
+        "probe",
+        help="Measure one target and record the facts (advisory; decides nothing)",
+    )
+    probe_parser.add_argument("selector", nargs="?", help="Target or pool name")
+    probe_parser.add_argument("--profile", help="Execution profile override")
+    probe_parser.add_argument("--cwd", help="Remote working directory override")
+    probe_parser.add_argument("--json", action="store_true", help="Emit JSON")
+    add_connection_flags(probe_parser)
+    probe_parser.set_defaults(handler=command_probe)
 
     exec_parser = subparsers.add_parser(
         "exec",

@@ -1,6 +1,6 @@
 ---
 name: remote-fleet-operator
-description: Operate remote machines, pools, and project-bound compute environments through fleetctl. Use when the task involves running experiments on named machines, syncing repos to remote hosts, staging scripts, submitting jobs to schedulers, inspecting fleet config, importing SSH aliases, or migrating repo-local remote settings into the private home-local fleet inventory. Prefer this over ad hoc raw SSH whenever the host should come from the user's managed fleet.
+description: Operate remote machines, pools, and project-bound compute environments through fleetctl. Use when the task involves running experiments on named machines, syncing repos to remote hosts, staging scripts, submitting jobs to schedulers, inspecting fleet config, importing SSH aliases, fanning a read-only check across the fleet, or migrating an older private inventory to the schema fleetctl reads today. Prefer this over ad hoc raw SSH whenever the host should come from the user's managed fleet.
 ---
 
 # Remote Fleet Operator
@@ -38,6 +38,10 @@ fleetctl explain <target-or-pool>
 
 If the current project is not bound, inspect the available targets or pools and
 either use an explicit target or bind the project.
+
+The manual is in the tool: `fleetctl help <topic>` for overview, verbs, roles,
+reach, config, secrets, jobs and examples, and `fleetctl doctor --probe` when
+the live fleet itself is in question. Read the topic instead of guessing.
 
 When a target may be scheduler-backed or otherwise policy-constrained, inspect:
 
@@ -82,13 +86,14 @@ When the user wants to bring hosts into the fleet:
   <bridge|login|compute|workstation|storage>`. The role is the whole point
   of the import; guessing it wrong is how a login node gets used as a
   workstation.
-- Migrate env-based machine config with
-  `fleetctl migrate-env --env-file <path> --prefix <PREFIX>`.
 - Define reusable protocols in `~/.config/fleet/protocols.d/*.toml` and point
   targets at them with `protocol = "name"`.
 - Declare how a host is reached on the target itself, direct first:
   `reach = ["direct", "via:<bridge>"]`. Never hide a hop in a secret or in
   `~/.ssh/config`.
+- For a host whose address changes on every start, use
+  `secret_backend = "command"` with `secret_ref` naming a script that prints
+  `host = "..."`. Its output is a secret: never echo it back to the user.
 - Seed the current live fleet into pass with `fleetctl seed-pass`, then rebuild
   the generated tree with `fleetctl deploy-config`.
 - When the dotfiles repo is the source of the operator surface, prefer the
@@ -113,17 +118,37 @@ When the user wants to bring hosts into the fleet:
   thing that was just refused, and do not add `--admin` to make a refusal go
   away -- it only lifts the cells the role marks as needing acknowledgement.
 - Container invocation belongs in a profile's `interpreter` or `submit_command`,
-  for example `["apptainer", "exec", ...]`. There is no runtime field to read.
+  for example `["apptainer", "exec", ...]`. There is no second runtime dimension:
+  a protocol's `job_runtime` no longer exists, and a config still carrying it is
+  reported by `doctor` and stripped by `fleetctl migrate-config`.
+- Ask the whole fleet a read-only question with `--all` or `--tag <tag>`, and
+  `--jobs <n>` to overlap them: `fleetctl smoke --all --jobs 4`. Only `smoke`,
+  `exec` and `job status` fan out; `sync`, `submit`, `script` and `job
+  logs|cancel` refuse and say why. Never loop a refused verb over `fleetctl
+  list` to fake it -- that is the partial-failure state the refusal exists to
+  prevent, and for `submit` it is a double submission.
+- Read the `note:` lines a fan-out prints. They name what the run did not cover,
+  and a fan-out that covered eight of ten hosts otherwise reads as ten.
+- `fleetctl probe <target>` measures a host and caches the facts for `doctor` to
+  compare against the declaration. It is advisory by construction: a probed fact
+  never selects a target or admits a verb. Fix drift by correcting the
+  inventory, not by expecting the measurement to win.
 - When a protocol reports `native_batch_required = true`, use
   `fleetctl submit --native-batch` so the scheduler sees the site-native script
   unchanged.
-- Use `--native-batch` when the site expects the scheduler script itself to
-  contain the runtime setup or policy-specific directives.
 - Prefer `fleetctl script` or `fleetctl submit` when the command is large enough
   that quoting would become fragile.
+- Routing is declared, not guessed: `reach` tries direct first and falls back to
+  a `via:` bridge once per control socket. `--route` pins a declared route and
+  `--no-fallback` refuses to degrade. A failing command is never re-routed, so
+  never wrap `exec` or `submit` in a retry loop; `sbatch` would run twice.
+- Select on declared capabilities rather than probing: `--require 'vram_gb>=24'`
+  refuses a named target that does not match, and `--fit` picks the smallest
+  sufficient candidate instead. Neither moves work to a host you did not name.
 - Use `--dry-run` before a first-time submit and before any `sync --delete`. It
-  resolves the plan locally and claims nothing about remote state, except for
-  `sync`, where it is a real `rsync --dry-run`.
+  resolves the plan locally and claims nothing about remote state -- for
+  `submit` it prints the rendered batch script, and for `sync` it is a real
+  `rsync --dry-run`.
 - Use raw `ssh` only for transport debugging or when `fleetctl` genuinely lacks
   the needed primitive.
 

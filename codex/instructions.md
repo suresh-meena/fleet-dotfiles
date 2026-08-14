@@ -9,7 +9,7 @@
   `fleetctl queue list <target>`.
 - Container invocation belongs in the profile's `interpreter` or
   `submit_command`, for example `["apptainer", "exec", ...]`. There is no
-  runtime field to read.
+  `job_runtime`: how work is invoked belongs to the profile that invokes it.
 - If `fleetctl protocol show <target>` reports `native_batch_required = true`,
   use `fleetctl submit --native-batch` and keep the site-native scheduler
   directives in the submitted script instead of relying on the wrapper path.
@@ -27,6 +27,19 @@
 - A refusal is the answer, not an obstacle. `fleetctl` exits 2 and names the
   alternative; take it, or ask. Do not fall back to raw `ssh` to do the thing
   that was just refused.
+- Routing is declared on the target, direct first with a `via:` bridge as the
+  fallback, and chosen once per control socket. Never wrap `exec` or `submit` in
+  a retry loop: a re-run of an accepted `sbatch` queues the job twice.
+- The manual is in the tool: `fleetctl help <topic>` covers verbs, roles, reach,
+  capabilities, config, secrets and jobs. Check yourself with `fleetctl explain`
+  and `--dry-run` before acting, and `fleetctl doctor --probe` for the live fleet.
+- Only read-only verbs fan out (`--all`, `--tag`, `--jobs`); `sync` and `submit`
+  refuse, and looping them over `fleetctl list` recreates exactly the
+  partial-failure state the refusal prevents. Read the `note:` lines: they name
+  what a run did not cover.
+- `fleetctl probe` measures a host; the declaration still decides. A probed fact
+  never selects a target, so fix drift in the inventory rather than expecting the
+  measurement to win.
 - Keep site policy and queue defaults in private fleet protocol files under
   `~/.config/fleet/protocols.d/`, not in repo code or project-specific hacks.
 - Treat `~/.config/fleet/` as generated state when the user has enabled the
