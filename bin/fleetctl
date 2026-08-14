@@ -6889,7 +6889,11 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
     plan = build_plan(context, args, "sync")
     target = plan.target
     secret = plan.secret
-    ssh_runtime = plan.connect()
+    # Both of these are decidable from the inventory alone -- `plan.cwd` is
+    # resolved during plan construction, and the guard compares against the
+    # target's declared `workdir` -- so they belong above `connect()`. A refusal
+    # that first pays a connection is a refusal the operator waits for, and on a
+    # bridged host that wait is a 10-second timeout before being told no.
     default_remote = (
         resolve_remote_path(args.remote_path, base=plan.cwd)
         if args.remote_path
@@ -6908,6 +6912,7 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
             direction=args.direction,
             force=bool(args.force),
         )
+    ssh_runtime = plan.connect()
 
     excludes = list(DEFAULT_SYNC_EXCLUDES)
     if plan.binding is not None:
