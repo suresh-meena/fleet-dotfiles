@@ -14,6 +14,8 @@ Use `fleetctl` as the control plane for remote work.
 - Avoid brittle shell quoting and repo-local SSH wrappers.
 - Make remote actions boring: inspect, smoke test, sync, execute, submit.
 - Keep sensitive connection material out of target metadata.
+- Treat each target's `role` as the boundary on what may be done to it,
+  and `--admin` as an acknowledgement rather than a convenience.
 - Put each host's base `workdir` on the target itself.
 - Use project bindings only for defaults and for project-specific absolute
   overrides when `workdir/<project-name>` is not correct.
@@ -31,6 +33,7 @@ Run these before changing anything substantial:
 fleetctl doctor
 fleetctl list
 fleetctl project show
+fleetctl explain <target-or-pool>
 ```
 
 If the current project is not bound, inspect the available targets or pools and
@@ -47,11 +50,11 @@ fleetctl queue list <target-or-pool>
 
 1. Resolve context.
    Use `fleetctl project show`, `fleetctl resolve`, or `fleetctl show`.
-2. Inspect protocol.
-   Use `fleetctl protocol show` to decide whether the target is direct or
-   scheduler-backed, whether the expected job runtime is host-side or Docker,
-   whether `native_batch_required` forces site-native batch scripts, and use
-   `fleetctl queue list` when queue choice matters.
+2. Inspect role and protocol.
+   Use `fleetctl explain <target>` for the admission answer, and
+   `fleetctl protocol show` to decide whether the target is direct or
+   scheduler-backed and whether `native_batch_required` forces site-native
+   batch scripts. Use `fleetctl queue list` when queue choice matters.
 3. Verify transport.
    Run `fleetctl smoke <target-or-pool>` unless the user explicitly wants a
    direct attempt first.
@@ -59,8 +62,8 @@ fleetctl queue list <target-or-pool>
    Use `fleetctl sync push ...`.
 5. Run the work through the narrowest interface that fits:
    - `fleetctl exec <target> -- ...` for direct-host argv execution
-   - `fleetctl exec --login <target> -- ...` for administrative commands on a
-     scheduler login surface
+   - `fleetctl exec --admin <target> -- ...` for control-plane commands such
+     as `squeue` or `sinfo` on a login surface, never for compute
    - `fleetctl script <local-script> --target <target> -- ...` for staged
      scripts on direct hosts
    - `fleetctl submit <local-script> --target <target>` for compute jobs,
@@ -75,11 +78,17 @@ fleetctl queue list <target-or-pool>
 
 When the user wants to bring hosts into the fleet:
 
-- Import an existing SSH alias with `fleetctl import-ssh <alias>`.
+- Import an existing SSH alias with `fleetctl import-ssh <alias> --role
+  <bridge|login|compute|workstation|storage>`. The role is the whole point
+  of the import; guessing it wrong is how a login node gets used as a
+  workstation.
 - Migrate env-based machine config with
   `fleetctl migrate-env --env-file <path> --prefix <PREFIX>`.
 - Define reusable protocols in `~/.config/fleet/protocols.d/*.toml` and point
   targets at them with `protocol = "name"`.
+- Declare how a host is reached on the target itself, direct first:
+  `reach = ["direct", "via:<bridge>"]`. Never hide a hop in a secret or in
+  `~/.ssh/config`.
 - Seed the current live fleet into pass with `fleetctl seed-pass`, then rebuild
   the generated tree with `fleetctl deploy-config`.
 - When the dotfiles repo is the source of the operator surface, prefer the
@@ -97,11 +106,14 @@ When the user wants to bring hosts into the fleet:
   fleet.
 - Prefer `fleetctl exec` over `ssh <host> 'bash -lc ...'` when the user payload
   is naturally an argv vector on direct hosts.
-- On scheduler-backed protocols, treat `fleetctl exec --login` as control-plane
-  access only. Use `fleetctl submit` for compute.
-- When a protocol reports `job_runtime = "docker"`, make the submitted script
-  launch the workload inside the allocated container runtime instead of assuming
-  host-side execution is the correct path.
+- On a `login` role, treat `fleetctl exec --admin` as control-plane access
+  only. Use `fleetctl submit` for compute.
+- A refusal is the answer, not an obstacle. When `fleetctl` exits 2 it names the
+  alternative; take that path, or ask. Do not reach for raw `ssh` to do the
+  thing that was just refused, and do not add `--admin` to make a refusal go
+  away -- it only lifts the cells the role marks as needing acknowledgement.
+- Container invocation belongs in a profile's `interpreter` or `submit_command`,
+  for example `["apptainer", "exec", ...]`. There is no runtime field to read.
 - When a protocol reports `native_batch_required = true`, use
   `fleetctl submit --native-batch` so the scheduler sees the site-native script
   unchanged.
@@ -109,6 +121,9 @@ When the user wants to bring hosts into the fleet:
   contain the runtime setup or policy-specific directives.
 - Prefer `fleetctl script` or `fleetctl submit` when the command is large enough
   that quoting would become fragile.
+- Use `--dry-run` before a first-time submit and before any `sync --delete`. It
+  resolves the plan locally and claims nothing about remote state, except for
+  `sync`, where it is a real `rsync --dry-run`.
 - Use raw `ssh` only for transport debugging or when `fleetctl` genuinely lacks
   the needed primitive.
 

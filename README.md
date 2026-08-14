@@ -57,7 +57,7 @@ activate       # Source venv/bin/activate
 - [`harvester`](docs/bin/harvester.md) - Download and organize ArXiv papers
 
 ### Remote Operations
-- [`fleetctl`](docs/bin/fleetctl.md) - Private fleet inventory and reliable remote execution/sync
+- [`fleetctl`](docs/bin/fleetctl.md) - Private fleet inventory, role-based admission control, and remote execution/sync
 
 `./setup.sh` now installs the `fleetctl` operator surface from `bin/` and, when
 the `infra/fleet` pass prefix exists locally, regenerates `~/.config/fleet/`

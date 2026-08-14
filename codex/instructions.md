@@ -7,10 +7,9 @@
 - Before using an unfamiliar target, inspect its rules with
   `fleetctl protocol show <target>` and, for scheduler-backed targets,
   `fleetctl queue list <target>`.
-- Respect the resolved protocol's runtime expectations. If `job_runtime` says
-  `docker`, prepare the submitted job script to launch the containerized
-  workload inside the scheduler allocation instead of running the payload on the
-  host directly.
+- Container invocation belongs in the profile's `interpreter` or
+  `submit_command`, for example `["apptainer", "exec", ...]`. There is no
+  runtime field to read.
 - If `fleetctl protocol show <target>` reports `native_batch_required = true`,
   use `fleetctl submit --native-batch` and keep the site-native scheduler
   directives in the submitted script instead of relying on the wrapper path.
@@ -21,10 +20,13 @@
   `fleetctl smoke <target>` unless the user explicitly asks to skip it.
 - When a project has a fleet binding, rely on that binding instead of inventing
   repo-local remote config.
-- Treat scheduler-backed protocols as login-node control surfaces:
-  `fleetctl exec --login <target> -- ...` is for administrative commands such as
-  `squeue`, `sinfo`, `sacct`, and `pwd`, while compute should go through
-  `fleetctl submit`.
+- A target's `role` decides what may be done to it, and `fleetctl explain
+  <target>` reports every verb for one host. On a `login` role,
+  `fleetctl exec --admin <target> -- ...` is for control-plane commands such as
+  `squeue`, `sinfo` and `sacct`; compute goes through `fleetctl submit`.
+- A refusal is the answer, not an obstacle. `fleetctl` exits 2 and names the
+  alternative; take it, or ask. Do not fall back to raw `ssh` to do the thing
+  that was just refused.
 - Keep site policy and queue defaults in private fleet protocol files under
   `~/.config/fleet/protocols.d/`, not in repo code or project-specific hacks.
 - Treat `~/.config/fleet/` as generated state when the user has enabled the

@@ -1,235 +1,166 @@
-# fleetctl - Private Remote Fleet Control
+# fleetctl
 
-Run remote work through a private host inventory that lives under your home
-directory instead of scattering machine definitions across individual repos.
+Run work on machines you do not all administer, through a private inventory,
+under one admission policy. One file of Python 3 and the standard library
+driving `ssh`, `scp` and `rsync` — no daemon, nothing installed on the remote.
 
-## Overview
+`fleetctl help` is the manual: `overview verbs roles reach config secrets jobs
+examples`. This page is the tour.
 
-`fleetctl` keeps generated host metadata, profiles, project bindings, and SSH
-runtime state in XDG paths:
+## Why
 
-- `~/.config/fleet/` - targets, pools, profiles, protocols, and project bindings
-- `~/.local/state/fleet/` - `known_hosts` and runtime state
-- `~/.cache/fleet/` - SSH control sockets
+The fleet grows in variety faster than in size — a Raspberry Pi whose only job
+is to be jumped through, a bare-metal GPU box behind it, a Slurm site reached
+through a login node. So most of fleetctl's value is in what it refuses.
+Running `python train.py` on a login node is not a mistake it lets you make by
+accident.
 
-In the pass-backed model, the public templates live in the dotfiles repo under
-`fleet/templates/`, private fleet source data lives in `pass`, and
-`~/.config/fleet/` is rendered from those two inputs with `fleetctl deploy-config`.
+## The pieces
 
-The dotfiles repo owns the operator interface, documentation, and Codex
-instructions. Sensitive hostnames, IPs, usernames, passwords, and keys stay out
-of version control.
+- **Target** — one SSH-reachable surface. A Slurm compute node is *not* a
+  target; node types are queue presets on the site's protocol.
+- **Pool** — an ordered set of targets. Selection takes the first enabled one.
+- **Protocol** — a site: whether compute is scheduled there, and its queues.
+- **Profile** — how work runs: interpreter, and submit/status/logs/cancel.
+- **Project binding** — a local directory mapped to a target and a remote root,
+  so a bound directory needs no `--target`.
+- **Secret** — connection material, kept out of the inventory and out of git.
 
-## Core Ideas
+| path | holds |
+| --- | --- |
+| `~/.config/fleet/` | `targets.d/` `pools.d/` `protocols.d/` `profiles.d/` `secrets/` `config.toml` `projects.toml` |
+| `~/.local/state/fleet/` | private `known_hosts`, staged scripts |
+| `~/.cache/fleet/mux/` | SSH control sockets |
 
-- Targets are concrete machines.
-- Pools are logical groups that resolve to one target.
-- Protocols define site rules and host-class behavior such as direct execution
-  versus scheduler-backed submission and queue defaults.
-- Profiles define how remote commands run: direct SSH or scheduler-backed.
-- Targets may define a host-level `workdir`, which is the base directory where
-  projects land on that machine.
-- Project bindings attach a local repo path to a default target or pool plus
-  any exceptional project-specific absolute overrides.
-- By default, a bound project resolves to `workdir/<project-name>`. Record a
-  per-target root in the project binding only when that default path is wrong.
-- `fleetctl` owns SSH transport details directly, including a private
-  `known_hosts` file and multiplexed control sockets.
+`$FLEET_CONFIG_HOME`, `$FLEET_STATE_HOME` and `$FLEET_CACHE_HOME` move all
+three; `--config-home`, `--state-home` and `--cache-home` do it for one run.
 
-## Bootstrap
+An unknown key in any of those files is fatal, and the error names the file, the
+key and a likely correction — because the default that fills in for a
+misspelling is always the permissive one.
+
+## Roles decide what may be done
+
+Every target declares a `role`. A role is a taint, not a label: it repels work,
+and `--admin` is the toleration — permission, never a recommendation.
+
+```
+role         ssh   exec  script sync  submit job
+bridge       yes   admin no     admin no     no
+login        yes   admin admin  yes   yes    yes
+compute      yes   yes   yes    yes   yes    yes
+workstation  yes   yes   yes    yes   yes    no
+storage      yes   admin no     yes   no     no
+
+yes = allowed    admin = needs --admin    no = refused
+```
+
+`fleetctl help roles` prints that table, generated from the same constant the
+admission check reads, so the two cannot drift apart.
+
+There is deliberately no role meaning "scheduler node where direct execution is
+fine", so the state this tool exists to prevent cannot be spelled in the config
+at all. A refusal names the alternative — *run compute through `fleetctl
+submit`* — and no flag lifts it. `fleetctl explain <target>` reports every cell
+for one host, where a refusal is the answer rather than an error.
+
+Role and protocol must agree, checked at load: `role = "login"` on a protocol
+that runs work directly is refused, and so is any other role on a
+scheduler-backed one. A target with no `role` gets the conservative reading of
+its protocol, and `doctor` names it.
+
+## Reach: direct first, the bridge as fallback
+
+How a host is reached is inventory, not a credential.
+
+```toml
+# targets.d/rtx1.toml
+reach = ["direct", "via:numpi"]
+```
+
+Ordered, and the order is the point: direct is the route taken, the bridge is
+the declared fallback. Every `via:` must name an enabled target whose `role` is
+`bridge`; self-bridges and cycles are refused at load, once per fleet rather
+than once per dependent.
+
+A hop is a full fleetctl connection to the bridge — its own secret, and the same
+private `known_hosts`, `IdentitiesOnly`, timeouts and control socket the
+destination gets — so it inherits nothing from `~/.ssh/config`, and it chains.
+Using a bridge is transport, not execution, so it takes no admission check;
+`exec` on that same bridge is still refused. A password-authenticated bridge is
+refused as a hop, because sshpass hands one password to the whole process tree.
+
+`--route direct` or `--route via:<bridge>` pins a *declared* route; fleetctl
+will not invent one. `fleetctl list --format topology` prints the graph.
+
+Current limit: the first declared route is the one used — nothing degrades
+automatically yet — and both routes to one host share a control socket, because
+OpenSSH's `%C` does not hash the ProxyCommand.
+
+## Start
 
 ```bash
 fleetctl init
-fleetctl doctor
+fleetctl import-ssh <alias> --name <target> --role workstation
+fleetctl doctor            # must be clean before anything else
+fleetctl doctor --probe    # also checks remote python3, which exec needs
 ```
 
-That creates the base layout, a `protocols.d/` directory, a default
-`plain-ssh` profile, and a starter `slurm-batch` profile.
+`migrate-config` rewrites an older inventory in place: it fills in `role`, makes
+`protocol` explicit, and lifts a secret's `proxy_jump` into `reach` with
+`direct` in front of it.
 
-## Pass-Backed Deploy
-
-The recommended long-term model is:
-
-- public templates and behavior in the dotfiles repo
-- private fleet source data in `pass`
-- generated `~/.config/fleet/`
-
-Seed the current live fleet into `pass`:
+## Daily
 
 ```bash
+fleetctl smoke <target>                            # transport, then workdir
+fleetctl exec <target> -- python3 -c 'print(1)'    # after `--` is verbatim
+fleetctl script ./setup.sh --target <target> -- --flag value
+fleetctl sync push .                               # from a bound directory
+fleetctl submit train.sh --target <target> --queue <preset>
+fleetctl job status <id> --target <target>
+```
+
+`--dry-run` prints the fully resolved plan and exits 0, claiming nothing about
+remote state — except for `sync`, where it runs `rsync --dry-run
+--itemize-changes` and returns rsync's own code.
+
+`sync --delete` refuses a home or root directory outright, and refuses the
+target's own workdir, or any pull, without `--force`.
+
+`submit` wraps your script in a scheduler preamble built from the queue preset;
+`--native-batch` sends your file unchanged instead. Nothing is submitted unless
+a job id could be reported back.
+
+## Secrets
+
+`host`, `user`, `port`, `auth`, `identity_file`, `password` and the SSH tuning
+knobs live in a secret, never in a target file — putting one in a target is a
+refusal with that explanation. Three backends: a private TOML file, a `pass`
+entry, or an inline table. Resolution is lazy.
+
+```bash
+fleetctl show <target> --secret               # host and user both redacted
+fleetctl show <target> --secret --sensitive   # ask for the real values
 fleetctl seed-pass --pass-prefix infra/fleet
-```
-
-Rebuild the generated tree at any time:
-
-```bash
 fleetctl deploy-config --pass-prefix infra/fleet --doctor
 ```
 
-The usual dotfiles bootstrap now runs that deploy step automatically during
-`./setup.sh` whenever the `infra/fleet` pass prefix exists locally.
+`deploy-config` renders a fresh tree beside the live one, validates it, and only
+then swaps — keeping one previous generation, and never clearing `secrets/`
+unless every target is pass-backed and it can refill them. `./setup.sh` runs it
+when the `infra/fleet` pass prefix exists locally.
 
-When targets use `secret_backend = "pass"`, the generated fleet tree contains
-only references to pass entries such as `infra/fleet/secrets/ampere` rather than
-plaintext secret files.
+Files are written `0600` and directories `0700`; `doctor` treats a group- or
+world-readable secret as a problem, not a warning. Prefer keys — and above all
+on the bridge, which every other host is reached through.
 
-## Bringing Hosts In
+## Exit status
 
-### Import an existing SSH alias
+`0` success · `1` `doctor` found problems · `2` any refusal, and any usage error
+· `130` interrupted. Anything else is the remote command's own.
 
-```bash
-fleetctl import-ssh gpu-a --name gpu-a
-```
+## Shell integration
 
-This resolves the alias through `ssh -G`, writes a private target record under
-`~/.config/fleet/targets.d/`, and writes the sensitive connection material under
-`~/.config/fleet/secrets/`.
-
-### Migrate an env schema
-
-```bash
-fleetctl migrate-env --env-file ~/projects/repo-a/.env --prefix REPO_A_REMOTE
-```
-
-Use this when you need to move an existing env-based machine schema into the
-private fleet inventory. Host-level workdirs are stored on targets, and only
-non-standard project paths stay in the project binding.
-
-If legacy target files still carry project-specific `remote_root` entries or
-inline connection fields, `fleetctl doctor` warns so the stale shape does not
-quietly linger.
-
-## Project Binding
-
-Bind a project to a default machine or pool:
-
-```bash
-fleetctl project bind ~/projects/repo-a --pool gpu-pool --profile plain-ssh
-fleetctl project bind ~/projects/repo-a --pool gpu-pool \
-  --target-root ampere=/data/ayand/repo-a \
-  --target-root ada=/data/home/ayand/repo-a \
-  --target-root hopper=/raid/phyayan/repo-a
-fleetctl project show ~/projects/repo-a
-fleetctl project list
-```
-
-Once a binding exists, most commands can omit the target when run from inside
-that project.
-
-## Protocol Inspection
-
-Inspect a target before you assume it behaves like a plain SSH box:
-
-```bash
-fleetctl protocol show hopper
-fleetctl queue list hopper
-```
-
-Scheduler-backed protocols expose queue presets, runtime hints such as
-`job_runtime = "docker"`, and can require compute to flow through
-`fleetctl submit` instead of `fleetctl exec`. If a protocol reports
-`native_batch_required = true`, use `fleetctl submit --native-batch` so the
-site-native scheduler script is submitted unchanged.
-
-## Daily Workflow
-
-### Connectivity smoke test
-
-```bash
-fleetctl smoke gpu-a
-```
-
-When a target defines a `workdir`, `smoke` reports whether that host-level
-directory exists. When a bound project resolves to `workdir/<project-name>` or
-to an explicit per-target project root, `smoke` reports that project root
-separately instead of failing transport just because the repo has not been
-synced there yet.
-
-### Run a remote argv vector
-
-```bash
-fleetctl exec gpu-a -- python3 -m pytest tests/test_streaming.py
-fleetctl exec --target gpu-a -- python3 -m pytest tests/test_streaming.py
-```
-
-`exec` runs the payload through a remote Python stub and avoids shell
-interpolation of the user command itself. `--target` is available when you want
-to force an explicit target without using the positional selector.
-
-On scheduler-backed targets, direct login-surface execution requires an explicit
-acknowledgment:
-
-```bash
-fleetctl exec --login hopper -- squeue --me
-fleetctl exec --login volta -- sinfo -h -o '%P'
-```
-
-Use `--login` only for administrative commands on the submission surface. Do
-not use it as a substitute for proper job submission.
-
-### Upload and run a script
-
-```bash
-fleetctl script scripts/train.sh --target gpu-a -- --config configs/base.toml
-```
-
-### Sync a project
-
-```bash
-fleetctl sync push . --target gpu-a
-fleetctl sync pull remote-downloads/ --target gpu-a artifacts/
-```
-
-### Submit through a scheduler profile
-
-For direct targets, `submit` falls back to running the staged script directly.
-For scheduler-backed protocols, `submit` wraps a normal script in a Slurm job
-using the protocol's queue defaults:
-
-```bash
-fleetctl submit scripts/train.sh --target hopper
-fleetctl submit scripts/train.sh --target hopper --queue q_1day-2G
-fleetctl submit scripts/train.sh --target volta --time 00:10:00
-fleetctl job status 12345 --target hopper --profile slurm-batch
-fleetctl job logs 12345 --target hopper --profile slurm-batch
-fleetctl job cancel 12345 --target hopper --profile slurm-batch
-```
-
-When `submit` parses a Slurm job ID, it also reports the resolved stdout and
-stderr paths under the protocol's `job_output_dir`.
-
-When a site expects a fully native scheduler script, bypass the wrapper:
-
-```bash
-fleetctl submit scripts/site_native.slurm --target volta --native-batch
-```
-
-That stages the batch script and hands it to the scheduler unchanged.
-
-## Shell Integration
-
-`fssh` in Zsh now merges classic SSH host discovery with `fleetctl list --format
-ssh-hosts`. Selecting a `fleet:*` entry routes the session through `fleetctl ssh`
-instead of raw `ssh`.
-
-## Files You Will Actually Touch
-
-- `fleet/templates/` - public templates for generated fleet config
-- `~/.config/fleet/targets.d/*.toml` - generated target metadata
-- `~/.config/fleet/targets.d/*.toml` may include host-level `workdir`, but not
-  repo-specific absolute project paths or sensitive connection material
-- `~/.config/fleet/protocols.d/*.toml` - generated site rules and queue presets
-- `~/.config/fleet/profiles.d/*.toml` - generated execution profiles
-- `~/.config/fleet/projects.toml` - generated local path to remote defaults and any
-  exceptional per-target project-root overrides
-- `pass` entries under your chosen prefix - private fleet source data and
-  pass-backed connection secrets
-
-## Security Notes
-
-- Keep `~/.config/fleet/` private; `fleetctl doctor` checks file modes.
-- Prefer pass-backed secrets over plaintext `~/.config/fleet/secrets/*.toml`.
-- Prefer key auth. Keep password auth only as a temporary fallback.
-- Do not commit `~/.config/fleet/` into any repo.
-- Use `fleetctl show --secret <target>` for a redacted preview; add
-  `--sensitive` only when you explicitly need the real host details on screen.
+`fssh` in Zsh merges classic SSH host discovery with `fleetctl list --format
+ssh-hosts`; picking a `fleet:*` entry routes through `fleetctl ssh`.
