@@ -136,6 +136,10 @@ remote state — except for `sync`, where it runs `rsync --dry-run
 `sync --delete` refuses a home or root directory outright, and refuses the
 target's own workdir, or any pull, without `--force`.
 
+`sync` compresses at level 1 rather than rsync's default 6, because a transfer
+multiplexed through a Raspberry Pi is bound by the compressor, not the link.
+`--compress-level 0` turns compression off for a fast local hop.
+
 `submit` wraps your script in a scheduler preamble built from the queue preset;
 `--native-batch` sends your file unchanged instead. Nothing is submitted unless
 a job id could be reported back.

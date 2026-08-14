@@ -52,6 +52,12 @@ DEFAULT_SYNC_EXCLUDES = [
     "runs/",
     "*.pyc",
 ]
+# rsync's -z is zlib level 6, which is the wrong trade for this fleet: every
+# clustered connection can be multiplexed through a Raspberry Pi, so the
+# compressor saturates a core long before the link fills.  Level 1 keeps most
+# of the win on source trees and hands the CPU back.
+DEFAULT_SYNC_COMPRESS_LEVEL = 1
+MAX_SYNC_COMPRESS_LEVEL = 9
 
 # ---- SECTION: admission policy ---------------------------------------------
 #
@@ -5162,6 +5168,13 @@ def command_script(args: argparse.Namespace, context: FleetContext) -> int:
 
 def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
     """Push or pull files with rsync."""
+    level = args.compress_level
+    if not 0 <= level <= MAX_SYNC_COMPRESS_LEVEL:
+        raise FleetError(
+            f"--compress-level must be 0-{MAX_SYNC_COMPRESS_LEVEL}, got {level}. "
+            "0 turns compression off; the range holds for zlib and zstd alike, "
+            "so the level stays valid whichever rsync negotiates."
+        )
     plan = build_plan(context, args, "sync")
     target = plan.target
     secret = plan.secret
@@ -5189,7 +5202,9 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
     if plan.binding is not None:
         excludes.extend(plan.binding.sync_excludes)
 
-    command = ["rsync", "-az"]
+    command = ["rsync", "-a"]
+    if level:
+        command += ["-z", f"--compress-level={level}"]
     if args.delete:
         command.append("--delete")
     for pattern in excludes:
@@ -5236,6 +5251,7 @@ def command_sync(args: argparse.Namespace, context: FleetContext) -> int:
                 "local_path": local,
                 "remote_path": default_remote,
                 "delete": bool(args.delete),
+                "compress_level": level,
                 "excludes": excludes,
                 "rsync": shlex.join(command),
             },
@@ -5942,6 +5958,12 @@ REFUSALS WORTH KNOWING
 
     `sync --delete` refuses a home or root directory outright, and
     refuses the target's own workdir, or any pull, without --force.
+
+    `sync` compresses at level 1, not rsync's default 6, because a
+    transfer multiplexed through a Raspberry Pi is bound by the
+    compressor rather than the link. `--compress-level 0` turns
+    compression off for a fast local hop; 9 pays off only over a slow
+    one.
 
     `--dry-run` prints the resolved plan and exits 0, claiming nothing
     about remote state. `sync` is the exception that earns it: it runs
@@ -6768,6 +6790,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Override a --delete safety refusal",
+    )
+    sync_parser.add_argument(
+        "--compress-level",
+        type=int,
+        default=DEFAULT_SYNC_COMPRESS_LEVEL,
+        metavar="N",
+        help=(
+            "rsync compression level 0-9 "
+            f"(default {DEFAULT_SYNC_COMPRESS_LEVEL}; 0 disables compression)"
+        ),
     )
     add_connection_flags(sync_parser)
     sync_parser.add_argument(
