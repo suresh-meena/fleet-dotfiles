@@ -4,8 +4,8 @@ Run work on machines you do not all administer, through a private inventory,
 under one admission policy. One file of Python 3 and the standard library
 driving `ssh`, `scp` and `rsync` — no daemon, nothing installed on the remote.
 
-`fleetctl help` is the manual: `overview verbs roles reach config secrets jobs
-examples`. This page is the tour.
+`fleetctl help` is the manual: `overview verbs roles reach capabilities config
+secrets jobs examples`. This page is the tour.
 
 ## Why
 
@@ -29,7 +29,7 @@ accident.
 | path | holds |
 | --- | --- |
 | `~/.config/fleet/` | `targets.d/` `pools.d/` `protocols.d/` `profiles.d/` `secrets/` `config.toml` `projects.toml` |
-| `~/.local/state/fleet/` | private `known_hosts`, staged scripts |
+| `~/.local/state/fleet/` | private `known_hosts`, `routes.json`, `jobs.jsonl`, `audit.jsonl` |
 | `~/.cache/fleet/mux/` | SSH control sockets |
 
 `$FLEET_CONFIG_HOME`, `$FLEET_STATE_HOME` and `$FLEET_CACHE_HOME` move all
@@ -164,7 +164,8 @@ fleetctl exec <target> -- python3 -c 'print(1)'    # after `--` is verbatim
 fleetctl script ./setup.sh --target <target> -- --flag value
 fleetctl sync push .                               # from a bound directory
 fleetctl submit train.sh --target <target> --queue <preset>
-fleetctl job status <id> --target <target>
+fleetctl jobs                                      # what you have submitted
+fleetctl job status <id>                           # target from the ledger
 ```
 
 `--dry-run` prints the fully resolved plan and exits 0, claiming nothing about
@@ -181,6 +182,26 @@ multiplexed through a Raspberry Pi is bound by the compressor, not the link.
 `submit` wraps your script in a scheduler preamble built from the queue preset;
 `--native-batch` sends your file unchanged instead. Nothing is submitted unless
 a job id could be reported back.
+
+## What gets written down
+
+Every accepted submission appends one line to `$FLEET_STATE_HOME/jobs.jsonl`,
+after the job id has been printed — so recording a job can never be what loses
+one. `fleetctl jobs` lists them newest first, and `job status|logs|cancel` read
+them, so an id the ledger knows needs neither `--target` nor `--profile`. An
+explicit flag still wins; an id two targets both claim is refused rather than
+guessed.
+
+The nine subcommands that open a connection each append one line to
+`$FLEET_STATE_HOME/audit.jsonl`: time, subcommand, resolved target and role,
+route taken, the flag names you typed, and the exit code — refusals included,
+since a refused `exec` on a login node is the line most worth having. No flag
+value and nothing after `--` is recorded, because that is where a pasted token
+would be; you cannot replay a command from this file, and that is the point.
+
+Both are `0600` and keep their newest 2000 lines. Staged scripts under a
+profile's `remote_script_root` are collected after 14 days, by the same round
+trip that creates the next one.
 
 ## Secrets
 

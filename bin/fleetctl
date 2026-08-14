@@ -15,6 +15,7 @@ import json
 import os
 import posixpath
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -1442,6 +1443,10 @@ def build_plan(context: FleetContext, args: argparse.Namespace, verb: str) -> Pl
     )
     protocol = context.resolve_protocol(target)
     admin = bool(getattr(args, "admin", False))
+    # Above admission and not below it: authorize() raises, and a refused command
+    # is precisely the event an audit log exists to hold.
+    args.audit_target = target.name
+    args.audit_role = resolve_role(target, protocol)
     authorize(verb, target, protocol, admin=admin)
     profile = context.resolve_profile(target, binding, getattr(args, "profile", None))
     plan = Plan(
@@ -1471,6 +1476,11 @@ def build_plan(context: FleetContext, args: argparse.Namespace, verb: str) -> Pl
         ),
         requirements=requirements,
     )
+    # The audit line is written from main()'s `finally`, long after the plan has
+    # gone out of scope, and the route it reports has to be the one the plan ends
+    # up on rather than the first candidate -- so it keeps the plan, not a copy of
+    # a field that is still going to change.
+    args.audit_plan = plan
     capability_preflight(plan, args)
     return plan
 
@@ -2515,6 +2525,7 @@ def submit_staged_script(
     ssh_runtime: dict[str, Any],
     output_path: str | None = None,
     error_path: str | None = None,
+    ledger: tuple[FleetPaths, dict[str, Any]] | None = None,
 ) -> int:
     """Hand one already-staged script to the profile's scheduler."""
     submit_argv = render_template_values(
@@ -2537,6 +2548,7 @@ def submit_staged_script(
         profile,
         output_path=output_path,
         error_path=error_path,
+        ledger=ledger,
     )
 
 
@@ -2546,12 +2558,21 @@ def report_submitted_job(
     *,
     output_path: str | None = None,
     error_path: str | None = None,
+    ledger: tuple[FleetPaths, dict[str, Any]] | None = None,
 ) -> int:
     """Echo scheduler output and report the job id without ever losing a queued job.
 
     Once the scheduler accepts the script the job exists, so nothing here may raise:
     a traceback at this point would orphan a real allocation whose only identifier
     was in output we had not printed yet.
+
+    The ledger is stamped here rather than by the caller because this is the only
+    place holding both the parsed id and the log paths with `%j` already resolved,
+    and it is stamped last, after everything the operator sees -- so recording a
+    job can never be what comes between a queued job and its id reaching the
+    terminal.  A submission whose id could not be parsed is not recorded at all:
+    the ledger answers questions keyed on an id, and the warning below already
+    says what to do instead.
     """
     if completed.stdout:
         print(completed.stdout, end="")
@@ -2579,10 +2600,23 @@ def report_submitted_job(
     if not job_id:
         job_id = match.group(1) if match.groups() else match.group(0)
     print(f"job_id={job_id}")
-    if output_path:
-        print(f"log_out={output_path.replace('%j', job_id)}")
-    if error_path:
-        print(f"log_err={error_path.replace('%j', job_id)}")
+    resolved_out = output_path.replace("%j", job_id) if output_path else ""
+    resolved_err = error_path.replace("%j", job_id) if error_path else ""
+    if resolved_out:
+        print(f"log_out={resolved_out}")
+    if resolved_err:
+        print(f"log_err={resolved_err}")
+    if ledger is not None:
+        paths, record = ledger
+        record_submitted_job(
+            paths,
+            {
+                **record,
+                "job_id": job_id,
+                "log_out": resolved_out,
+                "log_err": resolved_err,
+            },
+        )
     return completed.returncode
 
 
@@ -3310,6 +3344,236 @@ def record_route_state(
         pass
 
 
+def jobs_ledger_file(paths: FleetPaths) -> Path:
+    """Where every submission the scheduler accepted is recorded, one line each."""
+    return paths.state_home / "jobs.jsonl"
+
+
+def audit_log_file(paths: FleetPaths) -> Path:
+    """Where every invocation that reached for a host is recorded, one line each."""
+    return paths.state_home / "audit.jsonl"
+
+
+# How many lines each of these files keeps.  A count and not an age: a thirty-day
+# array job is still the job you want `job status` to resolve, so forgetting by
+# date would drop exactly the record still in use, while forgetting by count only
+# drops a job once you have submitted two thousand newer ones.
+JSONL_KEEP_LINES = 2000
+
+
+def append_jsonl(
+    path: Path, record: dict[str, Any], *, keep: int = JSONL_KEEP_LINES
+) -> None:
+    """Append one record to a private JSON-lines file and cap the file's length.
+
+    The file is opened 0600 and re-chmodded on every append, because a plain
+    `open(path, "a")` under the usual 022 umask produces 0644, and neither of
+    these files is one to hand to every account on a shared laptop.  The chmod
+    also repairs a file written before this rule existed.
+
+    One `os.write` of one line to an O_APPEND descriptor is what keeps two
+    concurrent submits from interleaving halves of a line.  The kernel makes no
+    such promise for regular files in general, which is why `read_jsonl` skips a
+    line it cannot parse instead of trusting the file.
+
+    Trimming happens after the append and never before: the line just written is
+    the one the operator is about to look up.  It costs reading the file back on
+    every append, which is two thousand short lines against an SSH round trip --
+    and it is what makes a corrupt line disappear for good, since `read_jsonl`
+    drops it and the rewrite does not put it back.
+    """
+    ensure_private_dir(path.parent, mode=STATE_DIR_MODE)
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
+    try:
+        os.fchmod(handle, PRIVATE_FILE_MODE)
+        os.write(handle, (json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
+    finally:
+        os.close(handle)
+    records = read_jsonl(path)
+    if len(records) > keep:
+        write_text_file(
+            path,
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in records[-keep:]),
+            mode=PRIVATE_FILE_MODE,
+        )
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read a JSON-lines state file oldest-first, skipping anything unreadable.
+
+    A ledger that raises is worse than a ledger with a hole in it.  One truncated
+    line -- a submit killed mid-write, or two that raced -- must not take
+    `fleetctl jobs` and `job status` down with it, so a line that is not a JSON
+    object is dropped and the rest of the file stays usable.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        try:
+            loaded = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(loaded, dict):
+            records.append(loaded)
+    return records
+
+
+def record_submitted_job(paths: FleetPaths, record: dict[str, Any]) -> None:
+    """Record one accepted submission, or warn and carry on.
+
+    Nothing here may raise.  This runs after the scheduler has accepted the
+    script, so the job already exists: an exception would orphan a real
+    allocation for the sake of a line of bookkeeping.  The failure is still worth
+    saying out loud -- an operator whose ledger silently stopped growing will
+    find out when `job status` asks for flags again -- so it degrades to a
+    warning on stderr and leaves the exit code alone.  The allocation is real
+    whether or not this file was writable.
+    """
+    try:
+        append_jsonl(jobs_ledger_file(paths), record)
+    except Exception as exc:
+        print(
+            f"warning: job {record.get('job_id') or '?'} was submitted but could not "
+            f"be recorded in {jobs_ledger_file(paths)} ({exc}); `fleetctl job status` "
+            "will need --target for it",
+            file=sys.stderr,
+        )
+
+
+def apply_job_ledger_defaults(args: argparse.Namespace, context: FleetContext) -> None:
+    """Fill in --target and --profile for a job id the ledger already knows.
+
+    `job status 812345` used to demand both flags every time, though the submit
+    that created the job knew both and threw them away.  An explicit flag still
+    wins: the ledger records where a job went, not where the next command should
+    go, and an operator holding a stale ledger needs a way past it.
+
+    An id two targets both claim is a refusal rather than a coin flip.  Two
+    clusters really do both have a job 12345, and `job cancel` guessing wrong
+    kills a live allocation that belongs to someone else while yours keeps
+    running.
+    """
+    if args.selector and args.profile:
+        return
+    selector = context.normalize_selector(args.selector)
+    matches = [
+        record
+        for record in read_jsonl(jobs_ledger_file(context.paths))
+        if str(record.get("job_id", "")) == args.job_id
+        and (selector is None or record.get("target") == selector)
+    ]
+    if not matches:
+        return
+    if selector is None:
+        claimed = sorted({str(item["target"]) for item in matches if item.get("target")})
+        if len(claimed) > 1:
+            raise FleetError(
+                f"job id {args.job_id!r} was submitted to more than one target "
+                f"({', '.join(claimed)}); pass --target to say which one you mean"
+            )
+    newest = matches[-1]
+    recorded_target = str(newest.get("target") or "")
+    if not args.selector and recorded_target:
+        if recorded_target not in context.targets:
+            # The ledger outlives the inventory, so this is a normal end state
+            # rather than a corrupt file.  Naming the ledger matters: the operator
+            # did not type this target, and "unknown target" about a name they
+            # never used reads as a bug in the tool.
+            raise FleetError(
+                f"the job ledger records job {args.job_id} on target "
+                f"{recorded_target!r}, which is no longer in the inventory. Pass "
+                "--target to name one that is, or run `fleetctl jobs` to see what "
+                "was recorded."
+            )
+        args.selector = recorded_target
+        # On stderr, because `job logs` output gets piped and this is a note about
+        # how the command was resolved rather than part of its answer.
+        print(
+            f"note: --target {recorded_target} resolved from the job ledger",
+            file=sys.stderr,
+        )
+    recorded_profile = str(newest.get("profile") or "")
+    # A profile since renamed out of the inventory falls back to normal
+    # resolution instead of failing.  That is what this command did before the
+    # ledger existed, and the profile is a detail the operator never asked about.
+    if not args.profile and recorded_profile in context.profiles:
+        args.profile = recorded_profile
+
+
+def record_invocation(
+    args: argparse.Namespace,
+    *,
+    head: list[str],
+    exit_code: int | None,
+) -> None:
+    """Record that a host was reached for: which verb, which host, what came of it.
+
+    No operator string is recorded, and that is the design rather than an
+    omission.  A fleetctl command line carries remote paths, script names and,
+    after `--`, whatever was pasted into the shell -- which is where a token ends
+    up.  A denylist of things to redact is a promise this file cannot keep,
+    because the leak is always the flag nobody thought of, and an audit log that
+    accumulates the contents of commands has stopped being a record and become a
+    secret store.  What lands here is fleetctl's own resolved facts plus the flag
+    *names* as typed: enough to answer what a shared cluster's admin asks -- when,
+    which host, which verb, did it run or was it refused -- and not enough to
+    reconstruct anything.  For `exec` that means knowing a command ran on a login
+    node at 14:02 and exited 1, and not what it was.  That is the trade.
+
+    Nothing here may raise and nothing here prints.  This runs from main()'s
+    `finally` while a SystemExit carrying the real exit code is already
+    propagating, so an exception would replace it with a traceback and the wrong
+    status; and a warning would fire on every command rather than once, for a
+    broken state directory `doctor` already reports.
+    """
+    try:
+        if not getattr(args, "audited", False):
+            return
+        plan = getattr(args, "audit_plan", None)
+        append_jsonl(
+            audit_log_file(
+                build_paths(
+                    config_home=args.config_home,
+                    state_home=args.state_home,
+                    cache_home=args.cache_home,
+                )
+            ),
+            {
+                "ts": utc_timestamp(),
+                "verb": " ".join(
+                    part
+                    for part in (args.command, getattr(args, "job_command", None))
+                    if part
+                ),
+                # Names only, split at `=` so `--cwd=/srv/customer-42` cannot
+                # smuggle its value in as part of one.  A value given as a
+                # separate word does not start with `--` and never arrives here.
+                "flags": sorted(
+                    {token.split("=", 1)[0] for token in head if token.startswith("--")}
+                ),
+                # Stamped by build_plan above its authorize() call, so a refusal
+                # still names the host it was refused on.
+                "target": getattr(args, "audit_target", "") or "",
+                "role": getattr(args, "audit_role", "") or "",
+                # ensure_route writes the route that came up back into the plan,
+                # so by the time main() unwinds this is the path traffic took --
+                # empty for a refusal, and the first candidate for a dry run,
+                # which `dry_run` below distinguishes.
+                "route": plan.route if plan is not None else "",
+                "admin": bool(getattr(args, "admin", False)),
+                "dry_run": bool(getattr(args, "dry_run", False)),
+                # None when fleetctl itself died, which is the honest record: we
+                # do not know what the remote did.
+                "exit": exit_code,
+            },
+        )
+    except Exception:
+        pass
+
+
 def ensure_route(plan: Plan) -> str:
     """Bring up a control master for the first of PLAN's routes that works.
 
@@ -3407,6 +3671,64 @@ def quote_remote_path(path: str) -> str:
     return shlex.quote(path)
 
 
+# A staging directory is named by exactly `secrets.token_hex(STAGE_TOKEN_BYTES)`,
+# and the collector below matches that shape rather than `*`.  Both constants live
+# here so the name a script is staged under and the glob that deletes it cannot
+# drift apart.
+STAGE_TOKEN_BYTES = 8
+STAGE_TOKEN_GLOB = "[0-9a-f]" * (STAGE_TOKEN_BYTES * 2)
+STAGE_RETENTION_DAYS = 14
+
+
+def stage_prune_command(remote_root: str, remote_dir: str) -> str:
+    """Build the one command that makes a staging directory and collects old ones.
+
+    Nothing has ever removed a staged script, and `submit` leaves two per job.
+    The collector therefore rides the `mkdir` staging already pays for: staging
+    is on the path of every single command, `submit` stages twice, and one host in
+    this fleet is reached through a Raspberry Pi, where a separate prune would be
+    two more round trips of real latency per submission.  What it actually costs
+    is one `find` over a single directory level.
+
+    Age comes from the remote `find`'s own view of mtime, because there is no
+    agent on the far side and a staging directory's mtime already *is* the moment
+    its script was written -- nothing touches it again.  The alternative, encoding
+    a timestamp in the name, would need an `ls` round trip to read the names back.
+
+    `mkdir` keeps its own failure, so the caller's "failed to create remote script
+    directory" still fires; everything the collector says or returns is discarded.
+    A stale directory nobody has permission to remove must never be the reason a
+    submit did not happen.
+
+    `-name` matches the exact shape of a fleet staging token rather than `*`: a
+    profile whose `remote_script_root` pointed somewhere shared would otherwise
+    hand `rm -rf` to whatever else lived there.  The cost is that directories
+    staged before this change are 8 characters of `[a-z0-9_]` and never match, so
+    they need one manual sweep -- which is the right trade against permanently
+    weakening the only thing keeping this honest.
+    """
+    collect = shlex.join(
+        [
+            "find",
+            remote_root,
+            "-mindepth", "1",
+            "-maxdepth", "1",
+            "-type", "d",
+            "-name", STAGE_TOKEN_GLOB,
+            "-mtime", f"+{STAGE_RETENTION_DAYS}",
+            "-exec", "rm", "-rf", "{}", "+",
+        ]
+    )
+    return shlex.join(
+        [
+            "/bin/sh",
+            "-c",
+            f"mkdir -p {quote_remote_path(remote_dir)} || exit 1; "
+            f"{collect} >/dev/null 2>&1; exit 0",
+        ]
+    )
+
+
 def remote_shell_path_command(argv: list[str], remote_path: str) -> str:
     """Build a remote command whose final argument is a fleet-resolved path."""
     return shlex.join(
@@ -3488,7 +3810,7 @@ def stage_remote_script(
 ) -> str:
     """Copy one local script into a remote scratch directory and return its path."""
     script_name = local_script.name
-    token = next(tempfile._get_candidate_names())
+    token = secrets.token_hex(STAGE_TOKEN_BYTES)
     ssh_runtime = ssh_runtime or {}
     remote_root = profile.remote_script_root
     if not remote_root.startswith("/"):
@@ -3503,7 +3825,7 @@ def stage_remote_script(
     mkdir = run_ssh_command(
         secret,
         allocate_tty=False,
-        remote_command=remote_shell_path_command(["mkdir", "-p"], remote_dir),
+        remote_command=stage_prune_command(remote_root, remote_dir),
         timeout=CONTROL_COMMAND_TIMEOUT,
         **ssh_runtime,
     )
@@ -3606,6 +3928,31 @@ def resolve_job_output_paths(
     output_path = resolve_one(output_override, "%j.out")
     error_path = resolve_one(error_override, "%j.err")
     return output_dir, output_path, error_path
+
+
+def job_ledger_record(plan: Plan, local_script: Path) -> dict[str, Any]:
+    """Describe one submission for the ledger, minus the id only the scheduler knows.
+
+    Every field comes off the frozen plan, so the ledger records the target,
+    protocol, profile and queue the submit actually used instead of a second
+    resolution of the same arguments.  `script` is the local path submitted, not
+    the staged remote one: the staged copy is a directory the collector removes.
+
+    Absent values are `""` and never null, so a record renders through
+    `format_table` without the word "None" appearing in a column.
+    """
+    return {
+        "ts": utc_timestamp(),
+        "target": plan.target.name,
+        "protocol": plan.protocol.name,
+        "profile": plan.profile.name,
+        "queue": plan.queue.name if plan.queue is not None else "",
+        "job_id": "",
+        "script": str(local_script),
+        "log_out": "",
+        "log_err": "",
+        "cwd": plan.cwd or "",
+    }
 
 
 def sanitize_job_name(value: str) -> str:
@@ -6039,6 +6386,7 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
             remote_script=remote_script,
             cwd=cwd,
             ssh_runtime=ssh_runtime,
+            ledger=(context.paths, job_ledger_record(plan, local_script)),
         )
 
     if protocol.native_batch_required:
@@ -6128,7 +6476,41 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
         ssh_runtime=ssh_runtime,
         output_path=output_path,
         error_path=error_path,
+        ledger=(context.paths, job_ledger_record(plan, local_script)),
     )
+
+
+# How many recorded submissions `fleetctl jobs` shows without being asked for
+# more.  Two thousand rows is not a listing.
+JOB_LIST_DEFAULT = 20
+
+JOB_LIST_COLUMNS = ["ts", "job_id", "target", "queue", "profile", "script"]
+
+
+def command_jobs(args: argparse.Namespace, context: FleetContext) -> int:
+    """List the submissions `fleetctl submit` recorded.
+
+    Newest first, because the job you are following is the one you just
+    submitted.  The table shows six of the ten fields; `--json` carries the whole
+    record, log paths included, since that is what a script piping this wants.
+    """
+    records = read_jsonl(jobs_ledger_file(context.paths))
+    if args.target:
+        selector = context.normalize_selector(args.target)
+        records = [record for record in records if record.get("target") == selector]
+    records.reverse()
+    if not args.all:
+        records = records[: max(args.limit, 0)]
+    emit_rows(
+        records,
+        JOB_LIST_COLUMNS,
+        as_json=bool(args.json),
+        when_empty=(
+            f"no submissions recorded in {jobs_ledger_file(context.paths)}; "
+            "`fleetctl submit` appends one line per job the scheduler accepted"
+        ),
+    )
+    return 0
 
 
 def run_job_command(
@@ -6160,18 +6542,21 @@ def run_job_command(
 
 def command_job_status(args: argparse.Namespace, context: FleetContext) -> int:
     """Check remote scheduler status."""
+    apply_job_ledger_defaults(args, context)
     plan = build_plan(context, args, "job")
     return run_job_command(plan, plan.profile.status_command, job_id=args.job_id)
 
 
 def command_job_logs(args: argparse.Namespace, context: FleetContext) -> int:
     """Fetch remote scheduler logs."""
+    apply_job_ledger_defaults(args, context)
     plan = build_plan(context, args, "job")
     return run_job_command(plan, plan.profile.logs_command, job_id=args.job_id)
 
 
 def command_job_cancel(args: argparse.Namespace, context: FleetContext) -> int:
     """Cancel one remote scheduler job."""
+    apply_job_ledger_defaults(args, context)
     plan = build_plan(context, args, "job")
     if args.dry_run:
         return report_plan(
@@ -6679,8 +7064,16 @@ ADMISSION VERBS
     so you can ask what an --admin run or a chosen route would do
     without doing it.
 
+    Those same nine append one line to
+    $FLEET_STATE_HOME/audit.jsonl: the time, the subcommand, the
+    resolved target and its role, the route taken, the flag names you
+    typed, and the exit code -- a refusal included, because a refused
+    `exec` on a login node is the line most worth having. No flag
+    value and nothing after `--` is recorded at all, because that is
+    where a pasted token would be.
+
 EVERYTHING ELSE
-    Inventory   list, show, explain, resolve, protocol show,
+    Inventory   jobs, list, show, explain, resolve, protocol show,
                 queue list, project bind|show|list
     Setup       init, import-ssh, migrate-config, migrate-env
     Secrets     seed-pass, deploy-config
@@ -6931,7 +7324,7 @@ SYNOPSIS
     $FLEET_CONFIG_HOME  (default ~/.config/fleet)
         config.toml  projects.toml
         targets.d/  pools.d/  protocols.d/  profiles.d/  secrets/
-    $FLEET_STATE_HOME   known_hosts
+    $FLEET_STATE_HOME   known_hosts  routes.json  jobs.jsonl  audit.jsonl
     $FLEET_CACHE_HOME   mux/  (ssh control sockets)
 
 DESCRIPTION
@@ -7032,6 +7425,7 @@ SYNOPSIS
         [--cpus-per-task <n>] [--mem <size>] [--output <path>]
         [--error <path>] [--native-batch] [--dry-run] [-- <args>]
     fleetctl job status|logs|cancel <job_id> [--target <target>]
+    fleetctl jobs [--target <target>] [--limit <n>] [--all] [--json]
 
 DESCRIPTION
     `submit` has two paths, and the profile decides which: a profile
@@ -7063,6 +7457,18 @@ JOB CONTROL
     quietly. Job output defaults to `%j.out` and `%j.err` under the
     protocol's `job_output_dir`, and the printed log paths have `%j`
     already replaced.
+
+THE LEDGER
+    Every submission the scheduler accepted appends one JSON line to
+    $FLEET_STATE_HOME/jobs.jsonl, and `fleetctl jobs` lists them,
+    newest first. `job status|logs|cancel` read it, so an id the ledger
+    knows needs neither --target nor --profile; an explicit flag still
+    wins, and an id two targets both claim is refused rather than
+    guessed. A line that cannot be parsed is skipped, never fatal, and
+    a ledger that cannot be written costs a warning and not the job.
+
+    The ledger keeps the newest 2000 submissions. Age would be the
+    wrong rule: a month-old array job is still one you want to follow.
 
 SEE ALSO
     fleetctl help verbs, fleetctl help config, fleetctl help examples
@@ -7100,9 +7506,11 @@ DESCRIPTION
     Run a local script with arguments; after `--` is verbatim:
         fleetctl script ./setup.sh --target <target> -- --flag value
 
-    Submit to a named queue, then follow the job:
+    Submit to a named queue, then follow the job; the ledger already
+    knows where it went:
         fleetctl submit train.sh --target <target> --queue <preset>
-        fleetctl job status <job_id> --target <target>
+        fleetctl jobs
+        fleetctl job status <job_id>
 
     Touch a login node's control plane on purpose:
         fleetctl exec <target> --admin -- squeue --me
@@ -7230,6 +7638,11 @@ def add_connection_flags(parser: argparse.ArgumentParser) -> None:
     Nine subparsers repeated the same five lines for `--admin`, which is exactly
     how a tenth verb ends up without it.  Admission and routing are both
     properties of connecting to a host, so they are declared together, once.
+
+    Reaching for a host is also what makes an invocation worth auditing, so the
+    audit's membership rule is declared here for the same reason.  It costs a
+    line for read-only `job status` and `job logs`, which is noise you can
+    filter; a missing line is not recoverable.
     """
     parser.add_argument(
         "--admin",
@@ -7238,6 +7651,7 @@ def add_connection_flags(parser: argparse.ArgumentParser) -> None:
     )
     add_route_flag(parser)
     add_capability_flags(parser)
+    parser.set_defaults(audited=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -7735,6 +8149,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit_parser.set_defaults(handler=command_submit)
 
+    jobs_parser = subparsers.add_parser(
+        "jobs",
+        help="List the jobs `fleetctl submit` recorded",
+    )
+    jobs_parser.add_argument("--target", help="Show only jobs submitted to one target")
+    jobs_parser.add_argument(
+        "--limit",
+        type=int,
+        default=JOB_LIST_DEFAULT,
+        help=f"Show at most this many, newest first (default {JOB_LIST_DEFAULT})",
+    )
+    jobs_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show every recorded job instead of the newest few",
+    )
+    jobs_parser.add_argument("--json", action="store_true", help="Emit JSON")
+    jobs_parser.set_defaults(handler=command_jobs)
+
     job_parser = subparsers.add_parser("job", help="Inspect or manage remote jobs")
     job_subparsers = job_parser.add_subparsers(dest="job_command", required=True)
 
@@ -7827,23 +8260,32 @@ def main() -> int:
             if hasattr(args, attribute):
                 setattr(args, attribute, payload)
 
+    # Set before the try, so an unhandled bug still writes a line: a null status
+    # records "fleetctl died and we do not know what the remote did".
+    exit_code: int | None = None
     try:
         # One load, one place.  There were twenty-four independent loads, which is
         # how `job status` came to resolve its target twice in one invocation.
         # The repair and diagnostic verbs opt out with `loads_own_config`: for
         # those a broken config is the input, not a precondition.
         if getattr(args, "loads_own_config", False):
-            return int(args.handler(args))
+            exit_code = int(args.handler(args))
+            return exit_code
         context = FleetContext.load(
             config_home=args.config_home,
             state_home=args.state_home,
             cache_home=args.cache_home,
         )
-        return int(args.handler(args, context))
+        exit_code = int(args.handler(args, context))
+        return exit_code
     except FleetError as exc:
-        parser.exit(exc.exit_code, f"error: {exc}\n")
+        exit_code = exc.exit_code
+        parser.exit(exit_code, f"error: {exc}\n")
     except KeyboardInterrupt:
+        exit_code = 130
         parser.exit(130, "error: interrupted\n")
+    finally:
+        record_invocation(args, head=head, exit_code=exit_code)
 
 
 if __name__ == "__main__":
