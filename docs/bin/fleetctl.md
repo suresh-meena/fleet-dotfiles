@@ -99,7 +99,14 @@ by trying each route in declared order until a master comes up. Direct gets 5
 seconds and a bridge 10, so preferring direct costs one timeout per
 `ControlPersist` window, and only when direct is down. Each route gets its own
 socket, since `%C` does not hash the ProxyCommand. `--no-fallback` refuses to
-degrade.
+degrade, and says so when it fails rather than telling you to declare the
+fallback you suppressed.
+
+A route that cannot be attempted counts as a route that did not come up — a
+wedged master that will not answer `ssh -O check`, a socket path over the length
+limit — so the next route still gets its turn. A `via:` route brings the
+bridge's own master up first, over the bridge's own `reach`, so a bridge with a
+fallback can use it.
 
 Once a master exists a failing command is a failing command — never retried,
 never re-routed. That is what keeps `exec` and `submit` at-most-once: a
@@ -150,6 +157,7 @@ fleetctl init
 fleetctl import-ssh <alias> --name <target> --role workstation
 fleetctl doctor            # must be clean before anything else
 fleetctl doctor --probe    # also checks remote python3, which exec needs
+                          # (a host out of reach is a warning, not a problem)
 ```
 
 `migrate-config` rewrites an older inventory in place: it fills in `role`, makes
