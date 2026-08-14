@@ -105,6 +105,44 @@ Once a master exists a failing command is a failing command — never retried,
 never re-routed. That is what keeps `exec` and `submit` at-most-once: a
 re-routed `sbatch` would queue the job twice.
 
+## Capabilities: ask for hardware, not for a hostname
+
+Declare what a machine has and let the tool choose:
+
+```toml
+# targets.d/rtx1.toml
+[capabilities]
+arch      = "x86_64"
+gpu_model = "RTX 3090"
+gpu_count = 1
+vram_gb   = 24
+cpus      = 16
+mem_gb    = 64
+```
+
+```
+fleetctl list --format capabilities                        # one row per surface
+fleetctl resolve --require 'vram_gb>=24' --fit             # smallest that fits
+fleetctl submit train.sh --require 'vram_gb>=40' --fit
+```
+
+Any key you like; `gpu_count`, `vram_gb`, `cpus` and `mem_gb` are compared as
+numbers. Operators: `>= <= > < = == !=`, comma-separated or repeated. An
+undeclared capability never satisfies a requirement.
+
+A requirement narrows a choice; it never moves work. Name a target — or let a
+project binding name one — and `--require` is a check that refuses with the
+mismatch. Give it a pool, or nothing at all, and it is a filter; `--fit` then
+takes the smallest sufficient candidate (fewest GPUs, then VRAM, CPUs, memory,
+then by name) and an ambiguous match without `--fit` is refused rather than
+guessed.
+
+On a Slurm site the hardware belongs to the partition, so a queue carries its
+own `[queue.capabilities]`. Those layer over the target's, `--require` filters
+the partitions, and `--fit` picks the smallest sufficient one. `--gpus` and
+`--cpus-per-task` are checked against the declared numbers before anything
+connects. `fleetctl help capabilities` has the rest.
+
 ## Start
 
 ```bash

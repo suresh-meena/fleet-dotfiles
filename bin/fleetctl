@@ -363,6 +363,7 @@ class TargetRecord:
     secret_backend: str = "file"
     secret_ref: str | None = None
     secret_inline: dict[str, Any] = field(default_factory=dict)
+    capabilities: dict[str, Any] = field(default_factory=dict)
     ssh_host_alias: str | None = None
     default_profile: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -410,6 +411,11 @@ class QueueRecord:
     constraint: str | None = None
     extra_directives: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
+    # What the scheduler allocates here, as opposed to what the login node has.
+    # A site's GPUs live on compute nodes behind the surface you SSH to, so
+    # without this `--require vram_gb>=64` would refuse the one target in the
+    # fleet whose partitions have 64 GB cards.
+    capabilities: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -420,7 +426,6 @@ class ProtocolRecord:
     kind: str = "direct"
     description: str | None = None
     default_profile: str | None = None
-    smoke_gpu_probe: bool = True
     gpu_request_mode: str = "gres"
     job_runtime: str = "host"
     native_batch_required: bool = False
@@ -645,20 +650,151 @@ class FleetContext:
             return selector[len("fleet:") :]
         return selector
 
+    def selectable_capabilities(
+        self, target: TargetRecord
+    ) -> list[tuple[str | None, dict[str, Any]]]:
+        """Every surface TARGET can offer, as (queue name or None, capabilities).
+
+        A login node's own hardware is not what a job gets: the GPUs live on
+        compute nodes behind it, described by the partitions.  So a scheduler
+        target offers one surface per queue -- the target's capabilities with the
+        queue's layered over them -- and satisfies a requirement when *any* of
+        them does.  Without this, `--require vram_gb>=64` would refuse the one
+        target in the fleet whose partitions have 64 GB cards.
+        """
+        protocol = self.resolve_protocol(target)
+        if not protocol.queues:
+            return [(None, dict(target.capabilities))]
+        surfaces = []
+        for queue in protocol.queues:
+            merged = dict(target.capabilities)
+            merged.update(queue.capabilities)
+            surfaces.append((queue.name, merged))
+        return surfaces
+
+    def capability_refusal(
+        self, target: TargetRecord, requirements: tuple[Requirement, ...]
+    ) -> str | None:
+        """Why TARGET cannot satisfy REQUIREMENTS, or None when it can."""
+        if not requirements:
+            return None
+        reports = []
+        for queue_name, capabilities in self.selectable_capabilities(target):
+            mismatches = capability_mismatches(requirements, capabilities)
+            if not mismatches:
+                return None
+            prefix = f"queue {queue_name!r} " if queue_name is not None else ""
+            reports.append(prefix + "; ".join(mismatches))
+        return " / ".join(reports)
+
+    def fit_cost(
+        self, target: TargetRecord, requirements: tuple[Requirement, ...] = ()
+    ) -> tuple[float, ...]:
+        """TARGET's cost as the cheapest surface on it that fits REQUIREMENTS."""
+        costs = [
+            capability_cost(capabilities)
+            for _, capabilities in self.selectable_capabilities(target)
+            if not capability_mismatches(requirements, capabilities)
+        ]
+        return min(costs) if costs else capability_cost({})
+
+    def require_target(
+        self, target: TargetRecord, requirements: tuple[Requirement, ...]
+    ) -> TargetRecord:
+        """Assert TARGET meets REQUIREMENTS, since something already named it.
+
+        A requirement against a named target is a check, not a search.  Silently
+        moving the work to a host that does fit would be the worst possible
+        reading: you asked for that machine.
+        """
+        refusal = self.capability_refusal(target, requirements)
+        if refusal is None:
+            return target
+        wanted = " ".join(str(item) for item in requirements)
+        raise FleetError(
+            f"{target.name!r} does not satisfy {wanted}: {refusal}. A requirement "
+            "checks the target you named; it never moves the work. Run "
+            f"`fleetctl resolve --require {wanted!r} --fit` to see what does."
+        )
+
+    def matching_targets(
+        self, requirements: tuple[Requirement, ...]
+    ) -> list[TargetRecord]:
+        """Every enabled target that satisfies REQUIREMENTS, by name."""
+        return [
+            target
+            for target in sorted(self.targets.values(), key=lambda item: item.name)
+            if target.enabled
+            and self.capability_refusal(target, requirements) is None
+        ]
+
+    def select_fleet(
+        self, requirements: tuple[Requirement, ...], *, fit: bool
+    ) -> TargetRecord:
+        """Pick one target out of the whole fleet by requirement alone.
+
+        Reached only when no selector and no project binding named anything.
+        Ambiguity is refused rather than resolved alphabetically: picking the
+        first of four sufficient machines is a coin toss wearing a rule.
+        """
+        wanted = " ".join(str(item) for item in requirements)
+        matches = self.matching_targets(requirements)
+        if not matches:
+            near = [
+                f"  {target.name}: {self.capability_refusal(target, requirements)}"
+                for target in sorted(
+                    self.targets.values(), key=lambda item: item.name
+                )
+                if target.enabled
+            ]
+            listing = "\n".join(near) if near else "  (no enabled targets)"
+            raise FleetError(f"no enabled target satisfies {wanted}:\n{listing}")
+        if fit:
+            return min(
+                matches,
+                key=lambda target: (self.fit_cost(target, requirements), target.name),
+            )
+        if len(matches) > 1:
+            names = ", ".join(target.name for target in matches)
+            raise FleetError(
+                f"{wanted} matches {len(matches)} targets ({names}). Pass --fit to "
+                "take the smallest sufficient one, or name the target you want."
+            )
+        return matches[0]
+
     def resolve_target(
         self,
         selector: str | None,
         *,
         cwd: Path | None = None,
+        requirements: tuple[Requirement, ...] = (),
+        fit: bool = False,
     ) -> tuple[TargetRecord, ProjectBinding | None]:
-        """Resolve a user selector or project default to one concrete target."""
+        """Resolve a user selector or project default to one concrete target.
+
+        Precedence is selector, then project binding, then a fleet-wide search --
+        and requirements never change it.  Against a name they are a check that
+        refuses; against a set (a pool, or the fleet) they are a filter.  The
+        alternative, letting `--require` retarget a named host, would mean a typo
+        in a capability silently ran your job somewhere else.
+        """
         binding = self.project_binding_for(cwd)
         normalized = self.normalize_selector(selector)
         if normalized:
             if normalized in self.targets:
-                return ensure_target_enabled(self.targets[normalized]), binding
+                return (
+                    self.require_target(
+                        ensure_target_enabled(self.targets[normalized]), requirements
+                    ),
+                    binding,
+                )
             if normalized in self.pools:
-                return self.select_pool(self.pools[normalized]), binding
+                return (
+                    self.select_pool(
+                        self.pools[normalized], requirements=requirements, fit=fit
+                    ),
+                    binding,
+                )
             raise FleetError(
                 f"unknown target or pool {normalized!r}; run `fleetctl list`"
             )
@@ -669,18 +805,33 @@ class FleetContext:
                     f"project binding for {binding.path} refers to missing target "
                     f"{binding.default_target!r}"
                 )
-            return ensure_target_enabled(self.targets[binding.default_target]), binding
+            return (
+                self.require_target(
+                    ensure_target_enabled(self.targets[binding.default_target]),
+                    requirements,
+                ),
+                binding,
+            )
         if binding and binding.default_pool:
             if binding.default_pool not in self.pools:
                 raise FleetError(
                     f"project binding for {binding.path} refers to missing pool "
                     f"{binding.default_pool!r}"
                 )
-            return self.select_pool(self.pools[binding.default_pool]), binding
+            return (
+                self.select_pool(
+                    self.pools[binding.default_pool],
+                    requirements=requirements,
+                    fit=fit,
+                ),
+                binding,
+            )
+        if requirements:
+            return self.select_fleet(requirements, fit=fit), binding
 
         raise FleetError(
             "no target specified and no project default available; "
-            "pass a target or pool explicitly"
+            "pass a target, a pool, or `--require` explicitly"
         )
 
     def pool_members(self, pool: PoolRecord) -> list[TargetRecord]:
@@ -709,11 +860,39 @@ class FleetContext:
             ]
         return [target for target in members if target.enabled]
 
-    def select_pool(self, pool: PoolRecord) -> TargetRecord:
+    def select_pool(
+        self,
+        pool: PoolRecord,
+        *,
+        requirements: tuple[Requirement, ...] = (),
+        fit: bool = False,
+    ) -> TargetRecord:
         """Select one target from a logical pool."""
         members = self.pool_members(pool)
         if not members:
             raise FleetError(f"pool {pool.name!r} has no eligible targets")
+        if requirements:
+            wanted = " ".join(str(item) for item in requirements)
+            eligible = [
+                target
+                for target in members
+                if self.capability_refusal(target, requirements) is None
+            ]
+            if not eligible:
+                detail = "\n".join(
+                    f"  {target.name}: "
+                    f"{self.capability_refusal(target, requirements)}"
+                    for target in members
+                )
+                raise FleetError(
+                    f"no member of pool {pool.name!r} satisfies {wanted}:\n{detail}"
+                )
+            members = eligible
+        if fit:
+            return min(
+                members,
+                key=lambda target: (self.fit_cost(target, requirements), target.name),
+            )
         return members[0]
 
     def resolve_profile(
@@ -801,6 +980,258 @@ class FleetContext:
         return parse_secret_dict(raw, source=source)
 
 
+# ---- SECTION: capabilities -------------------------------------------------
+#
+# `role` is a hard admission boundary; capabilities are the soft layer above it,
+# and the split is deliberate.  Nomad added node pools precisely because
+# affinities and constraints "do not easily prevent other jobs from placing
+# allocations in a set of nodes": attribute matching is the wrong tool for a
+# boundary, and a boundary is the wrong tool for "which of these will fit".
+#
+# Declared values are authoritative and nothing here is measured.  Salt's own
+# documentation calls minion-supplied grains "less secure than other
+# identifiers" for the reason that applies here too -- what a machine has is a
+# fact its owner writes down, not something discovered at selection time and
+# possibly stale by the time the job lands.
+#
+# The vocabulary is open on purpose, and this is the one place in the file where
+# an unrecognised key is not fatal.  A fleet growing in variety wants `nvlink`,
+# `rocm_version`, `infiniband` next month, and a closed list would make the tool
+# the obstacle.  It is safe here for a reason that holds nowhere else: elsewhere
+# an unknown key fails *open*, because the default that quietly fills in is the
+# permissive one, whereas a misspelled capability fails *closed* --
+# `--require vram_bg>=24` matches nothing and says exactly that.
+#
+# What is still enforced is the part a mistake would hide.  A value must be a
+# scalar, because a list would silently satisfy no comparison, and the four keys
+# compared as numbers must really be numbers -- checked at load time rather than
+# at the point a comparison would raise.
+
+# The keys `--fit` costs, in the order it minimises them.  Written down because
+# a hidden cost function is an unpredictable one: fewest GPUs, then least VRAM,
+# then fewest CPUs, then least memory -- the smallest sufficient machine, so the
+# big box stays free for the job that needs it.  Ties break on the target name,
+# since a tie broken any other way is one you cannot script against.
+FIT_ORDER = ("gpu_count", "vram_gb", "cpus", "mem_gb")
+
+CAPABILITY_NUMBER_KEYS = frozenset(FIT_ORDER)
+
+# Keys common enough that a near-miss is worth reporting.  Not a closed list --
+# nothing rejects a key outside it -- just the seed of the vocabulary `doctor`
+# spell-checks against.
+CAPABILITY_COMMON_KEYS = ("arch", "gpu_model", *FIT_ORDER)
+
+# Two-character operators first, so `>=` is never read as `>` with a stray `=`.
+REQUIREMENT_OPERATORS = (">=", "<=", "!=", "==", ">", "<", "=")
+REQUIREMENT_ORDERINGS = (">=", "<=", ">", "<")
+
+
+@dataclass(frozen=True)
+class Requirement:
+    """One `key<op>value` clause from `--require`."""
+
+    key: str
+    operator: str
+    text: str
+
+    def __str__(self) -> str:
+        return f"{self.key}{self.operator}{self.text}"
+
+
+def parse_requirements(values: Iterable[str]) -> tuple["Requirement", ...]:
+    """Parse `--require` clauses like `vram_gb>=24,gpu_count>=1`.
+
+    Every clause carries an operator, and there is deliberately no bare-key
+    form.  A bare key would have to mean either "declares this" or "is called
+    this", and `--fit lab-gpu` reading as a target name is exactly the ambiguity
+    that makes a selection flag dangerous.
+    """
+    requirements: list[Requirement] = []
+    for value in values or ():
+        for raw in str(value).split(","):
+            clause = raw.strip()
+            if not clause:
+                continue
+            for operator in REQUIREMENT_OPERATORS:
+                key, found, text = clause.partition(operator)
+                if not found:
+                    continue
+                if not key.strip() or not text.strip():
+                    raise FleetError(
+                        f"malformed requirement {clause!r}: expected "
+                        "`key<op>value`, as in `vram_gb>=24`"
+                    )
+                requirements.append(
+                    Requirement(key.strip(), operator, text.strip())
+                )
+                break
+            else:
+                raise FleetError(
+                    f"requirement {clause!r} has no comparison in it. Write "
+                    f"`{clause}>=<value>` or `{clause}=<value>`; a bare key would "
+                    "be ambiguous with a target name."
+                )
+    return tuple(requirements)
+
+
+def capability_number(value: Any) -> float | None:
+    """Return VALUE as a number, or None when it is not one.
+
+    `bool` is excluded deliberately: TOML's `true` is an int in Python, and
+    `gpu_count = true` comparing greater than zero is not a fact about a machine.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def capability_text(value: Any) -> str:
+    """Render one capability value the way a requirement compares it."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def requirement_mismatch(
+    requirement: "Requirement", capabilities: dict[str, Any]
+) -> str | None:
+    """Return why CAPABILITIES fail REQUIREMENT, or None when they satisfy it.
+
+    Absence is a mismatch, never a pass.  An undeclared capability is an
+    unknown, and reading an unknown as sufficient is how a job lands on a
+    machine that cannot run it.
+    """
+    if requirement.key not in capabilities:
+        close = difflib.get_close_matches(
+            requirement.key, sorted(capabilities), n=1, cutoff=0.7
+        )
+        hint = f", though it declares {close[0]!r}" if close else ""
+        return f"declares no {requirement.key!r}{hint}"
+    have = capabilities[requirement.key]
+    wanted_number = capability_number(requirement.text)
+    have_number = capability_number(have)
+    if requirement.operator in ("=", "==", "!="):
+        equal = capability_text(have) == requirement.text
+        if not equal and wanted_number is not None and have_number is not None:
+            equal = have_number == wanted_number
+        if (requirement.operator == "!=") is equal:
+            return f"{requirement.key} is {capability_text(have)!r}"
+        return None
+    if wanted_number is None:
+        raise FleetError(
+            f"requirement {requirement} orders its values, so {requirement.text!r} "
+            "has to be a number"
+        )
+    if have_number is None:
+        return (
+            f"{requirement.key} is {capability_text(have)!r}, which "
+            f"`{requirement.operator}` cannot order"
+        )
+    satisfied = {
+        ">=": have_number >= wanted_number,
+        "<=": have_number <= wanted_number,
+        ">": have_number > wanted_number,
+        "<": have_number < wanted_number,
+    }[requirement.operator]
+    if satisfied:
+        return None
+    return f"{requirement.key} is {capability_text(have)}"
+
+
+def capability_mismatches(
+    requirements: Iterable["Requirement"], capabilities: dict[str, Any]
+) -> list[str]:
+    """Every reason CAPABILITIES fail REQUIREMENTS, not just the first one."""
+    reasons: list[str] = []
+    for requirement in requirements:
+        reason = requirement_mismatch(requirement, capabilities)
+        if reason is not None:
+            reasons.append(f"{requirement}: {reason}")
+    return reasons
+
+
+def capability_cost(capabilities: dict[str, Any]) -> tuple[float, ...]:
+    """Return the FIT_ORDER cost vector for CAPABILITIES.
+
+    An undeclared key sorts last rather than first: `--fit` takes the smallest
+    machine *known* to be sufficient, and an unknown is not smaller than a
+    number.
+    """
+    return tuple(
+        float("inf") if number is None else number
+        for number in (
+            capability_number(capabilities.get(key)) for key in FIT_ORDER
+        )
+    )
+
+
+def capability_key_warnings(what: str, capabilities: dict[str, Any]) -> list[str]:
+    """Report capability keys that look like a common key misspelled.
+
+    The vocabulary stays open -- nothing here rejects anything, and a genuinely
+    new key like `nvlink` or `rocm_version` is silent.  But a misspelled
+    capability is invisible in the one way that matters: `--require vram_bg>=24`
+    matches nothing, and a filter that matches nothing looks exactly like a fleet
+    with nothing big enough in it.  `doctor` is where that gets caught.
+    """
+    warnings = []
+    for key in sorted(capabilities):
+        if key in CAPABILITY_COMMON_KEYS:
+            continue
+        close = difflib.get_close_matches(
+            key, CAPABILITY_COMMON_KEYS, n=1, cutoff=0.8
+        )
+        if close:
+            warnings.append(
+                f"{what} declares capability {key!r}, which looks like {close[0]!r}. "
+                "Capability keys are open on purpose, so this is not an error -- but "
+                "`--require` matches the exact spelling, so nothing would ever "
+                "select it."
+            )
+    return warnings
+
+
+def declares_no_gpu(target: "TargetRecord") -> bool:
+    """True only when TARGET says outright that it has no GPU.
+
+    Silence is not a claim.  This replaced `protocol.smoke_gpu_probe`, which
+    defaulted to on, so a target that declares nothing keeps being probed and
+    only an explicit `gpu_count = 0` turns the check off.
+    """
+    return capability_number(target.capabilities.get("gpu_count")) == 0
+
+
+def parse_capabilities(
+    value: Any, *, what: str, source: Path | None = None
+) -> dict[str, Any]:
+    """Validate one `[capabilities]` table.  See this section's note on keys."""
+    table = check_table(value, what=what, source=source)
+    where = f" in {source}" if source is not None else ""
+    capabilities: dict[str, Any] = {}
+    for key, item in table.items():
+        if isinstance(item, (dict, list, tuple)):
+            raise FleetError(
+                f"`{key}` in {what}{where} must be a single value, not "
+                f"{type(item).__name__}: a requirement compares one value, so a "
+                "list here would match nothing and explain nothing"
+            )
+        if key in CAPABILITY_NUMBER_KEYS:
+            number = capability_number(item)
+            if number is None or number < 0:
+                raise FleetError(
+                    f"`{key}` in {what}{where} must be a non-negative number, not "
+                    f"{item!r}: `--require {key}>=n` compares it numerically"
+                )
+            item = int(number) if number.is_integer() else number
+        capabilities[key] = item
+    return capabilities
+
+
 # ---- SECTION: resolution (config + args -> Plan, no remote I/O) ------------
 
 
@@ -828,6 +1259,11 @@ class Plan:
     pool: PoolRecord | None
     admin: bool
     routes: tuple[str, ...] = DEFAULT_REACH
+    # Resolved here rather than in the handler, so `--dry-run` and `explain`
+    # report the queue the submit will really use instead of guessing at it
+    # again.  None for every verb that has no queue.
+    queue: QueueRecord | None = None
+    requirements: tuple[Requirement, ...] = ()
     _secret: FleetSecret | None = field(default=None, compare=False, repr=False)
     _route: str | None = field(default=None, compare=False, repr=False)
 
@@ -895,10 +1331,100 @@ class Plan:
             "protocol_kind": self.protocol.kind,
             "profile": self.profile.name,
             "submits": bool(self.profile.submit_command),
+            "queue": self.queue.name if self.queue is not None else None,
+            "requirements": [str(item) for item in self.requirements],
             "remote_cwd": self.cwd,
             "admin": self.admin,
             "project": str(self.binding.path) if self.binding is not None else None,
         }
+
+
+# Requested-versus-declared pairs, checked before a connection is opened.
+# Deliberately not `queue.gpus`/`queue.cpus_per_task`: those are what the preset
+# *asks the scheduler for*, not what the partition has, so comparing against
+# them would refuse a job for exceeding a default.  Memory is left out on
+# purpose -- `--mem` units are scheduler-specific, and a wrong parse would
+# refuse a valid job, which is worse than not checking.
+PREFLIGHT_CAPABILITY_FLAGS = (
+    ("gpus", "--gpus", "gpu_count"),
+    ("cpus_per_task", "--cpus-per-task", "cpus"),
+)
+
+
+def plan_queue(
+    args: argparse.Namespace,
+    *,
+    verb: str,
+    target: TargetRecord,
+    protocol: ProtocolRecord,
+    profile: ProfileRecord,
+    requirements: tuple[Requirement, ...] = (),
+    fit: bool = False,
+) -> QueueRecord | None:
+    """The queue VERB will use on TARGET, or None when it uses none.
+
+    The guards mirror command_submit's branch order exactly, so every error it
+    already raised still fires in the same order and from the same place.  A
+    queue is only a thing when a profile submits, the caller did not ask for the
+    site's own batch script, and the protocol does not insist on one.
+    """
+    if verb != "submit" or not profile.submit_command:
+        return None
+    if getattr(args, "native_batch", False) or protocol.native_batch_required:
+        return None
+    return resolve_queue(
+        protocol,
+        getattr(args, "queue", None),
+        target_capabilities=target.capabilities,
+        requirements=requirements,
+        fit=fit,
+    )
+
+
+def plan_capabilities(plan: "Plan") -> dict[str, Any]:
+    """The capabilities of the surface PLAN actually lands on."""
+    capabilities = dict(plan.target.capabilities)
+    if plan.queue is not None:
+        capabilities.update(plan.queue.capabilities)
+    return capabilities
+
+
+def capability_preflight(plan: "Plan", args: argparse.Namespace) -> None:
+    """Refuse a request larger than the declared hardware, at zero network cost.
+
+    Only on a path that has a queue, which is the only path where these flags
+    mean anything: everywhere else `ensure_no_resource_flags` already refuses
+    them outright, and answering "your machine only has one GPU" would be
+    answering the wrong question about a flag that could never have been honoured.
+
+    An undeclared capability is not a refusal here, which is the opposite of how
+    `--require` reads absence -- and the asymmetry is the point.  `--require` is
+    a question, so an unknown cannot answer it; `--gpus 4` names a machine and
+    states a need, and refusing that because nobody has written down a
+    `gpu_count` yet would make declaring capabilities mandatory rather than
+    useful.
+    """
+    if plan.queue is None:
+        return
+    capabilities = plan_capabilities(plan)
+    for attr, flag, key in PREFLIGHT_CAPABILITY_FLAGS:
+        requested = capability_number(getattr(args, attr, None))
+        if requested is None:
+            continue
+        declared = capability_number(capabilities.get(key))
+        if declared is None or requested <= declared:
+            continue
+        where = (
+            f"{plan.target.name!r} queue {plan.queue.name!r}"
+            if plan.queue is not None
+            else repr(plan.target.name)
+        )
+        raise FleetError(
+            f"{flag} {capability_text(getattr(args, attr))} exceeds {where}, which "
+            f"declares {key} = {capability_text(capabilities[key])}. Fix the "
+            "request, pick another target, or correct the declaration if the "
+            "hardware changed."
+        )
 
 
 def build_plan(context: FleetContext, args: argparse.Namespace, verb: str) -> Plan:
@@ -909,17 +1435,22 @@ def build_plan(context: FleetContext, args: argparse.Namespace, verb: str) -> Pl
     first, and no way to act on a host without a Plan.
     """
     selector = context.normalize_selector(getattr(args, "selector", None))
-    target, binding = context.resolve_target(selector, cwd=Path.cwd())
+    requirements = parse_requirements(getattr(args, "require", None) or ())
+    fit = bool(getattr(args, "fit", False))
+    target, binding = context.resolve_target(
+        selector, cwd=Path.cwd(), requirements=requirements, fit=fit
+    )
     protocol = context.resolve_protocol(target)
     admin = bool(getattr(args, "admin", False))
     authorize(verb, target, protocol, admin=admin)
-    return Plan(
+    profile = context.resolve_profile(target, binding, getattr(args, "profile", None))
+    plan = Plan(
         verb=verb,
         context=context,
         target=target,
         binding=binding,
         protocol=protocol,
-        profile=context.resolve_profile(target, binding, getattr(args, "profile", None)),
+        profile=profile,
         cwd=resolve_remote_root(target, binding, getattr(args, "cwd", None)),
         selector=selector,
         pool=context.pools.get(selector) if selector else None,
@@ -929,7 +1460,19 @@ def build_plan(context: FleetContext, args: argparse.Namespace, verb: str) -> Pl
             getattr(args, "route", None),
             no_fallback=bool(getattr(args, "no_fallback", False)),
         ),
+        queue=plan_queue(
+            args,
+            verb=verb,
+            target=target,
+            protocol=protocol,
+            profile=profile,
+            requirements=requirements,
+            fit=fit,
+        ),
+        requirements=requirements,
     )
+    capability_preflight(plan, args)
+    return plan
 
 
 def resolve_routes(
@@ -1062,6 +1605,7 @@ TARGET_KEYS = frozenset(
         "secret_backend",
         "secret_ref",
         "secret",
+        "capabilities",
         "ssh_host_alias",
         "default_profile",
         "metadata",
@@ -1075,7 +1619,6 @@ PROTOCOL_KEYS = frozenset(
         "kind",
         "description",
         "default_profile",
-        "smoke_gpu_probe",
         "gpu_request_mode",
         "job_runtime",
         "native_batch_required",
@@ -1101,6 +1644,7 @@ QUEUE_KEYS = frozenset(
         "directive",
         "directives",
         "notes",
+        "capabilities",
     }
 )
 PROFILE_KEYS = frozenset(
@@ -1170,6 +1714,11 @@ DEPRECATED_TARGET_KEYS: dict[str, str] = {
 DEPRECATED_PROTOCOL_KEYS: dict[str, str] = {
     "scheduler_required": "the role matrix decides this for every verb",
     "allow_login_exec": "the role matrix decides this; pass --admin per command",
+    "smoke_gpu_probe": (
+        "whether a host has a GPU is a fact about the host, not about the site "
+        'protocol shared by all of them; declare `gpu_count` under the target\'s '
+        "`[capabilities]` and `smoke` follows it"
+    ),
 }
 DEPRECATED_POOL_KEYS: dict[str, str] = {
     "default_profile": (
@@ -1419,6 +1968,11 @@ def load_targets(path: Path) -> dict[str, TargetRecord]:
             secret_inline=check_table(
                 raw.get("secret", {}), what=f"`secret` for {what}", source=source
             ),
+            capabilities=parse_capabilities(
+                raw.get("capabilities", {}),
+                what=f"`[capabilities]` for {what}",
+                source=source,
+            ),
             ssh_host_alias=optional_str(raw.get("ssh_host_alias")),
             default_profile=optional_str(raw.get("default_profile")),
             metadata=check_table(
@@ -1475,7 +2029,6 @@ def built_in_protocols() -> dict[str, ProtocolRecord]:
         kind="direct",
         description="Direct SSH execution on a host-level workdir.",
         default_profile="plain-ssh",
-        smoke_gpu_probe=True,
         gpu_request_mode="gres",
         job_runtime="host",
         native_batch_required=False,
@@ -1485,7 +2038,6 @@ def built_in_protocols() -> dict[str, ProtocolRecord]:
         kind="slurm",
         description="Scheduler-backed login surface that submits compute via Slurm.",
         default_profile="slurm-batch",
-        smoke_gpu_probe=False,
         gpu_request_mode="gres",
         job_runtime="host",
         native_batch_required=False,
@@ -1551,6 +2103,11 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
                     constraint=optional_str(item.get("constraint")),
                     extra_directives=directive_values,
                     notes=note_values,
+                    capabilities=parse_capabilities(
+                        item.get("capabilities", {}),
+                        what=f"`[queue.capabilities]` for {queue_name!r} in {what}",
+                        source=source,
+                    ),
                 )
             )
         docs = raw.get("docs", [])
@@ -1576,7 +2133,6 @@ def load_protocols(path: Path) -> dict[str, ProtocolRecord]:
             description=optional_str(raw.get("description")),
             default_profile=optional_str(raw.get("default_profile"))
             or ("slurm-batch" if kind == "slurm" else "plain-ssh"),
-            smoke_gpu_probe=bool(raw.get("smoke_gpu_probe", kind != "slurm")),
             gpu_request_mode=check_vocabulary(
                 str(raw.get("gpu_request_mode", "gres")),
                 GPU_REQUEST_MODES,
@@ -3061,21 +3617,66 @@ def sanitize_job_name(value: str) -> str:
 def resolve_queue(
     protocol: ProtocolRecord,
     requested: str | None,
+    *,
+    target_capabilities: dict[str, Any] | None = None,
+    requirements: tuple[Requirement, ...] = (),
+    fit: bool = False,
 ) -> QueueRecord:
-    """Resolve one queue preset from a protocol."""
+    """Resolve one queue preset from a protocol.
+
+    Requirements filter the partitions, because on a scheduler the hardware a job
+    gets is the partition's rather than the login node's.  `--fit` then takes the
+    smallest sufficient one, so a single-GPU job stops booking the eight-GPU
+    partition.  With neither flag this is exactly the old rule: the declared
+    default, else the first declared.
+    """
+    base = dict(target_capabilities or {})
+
+    def surface(queue: QueueRecord) -> dict[str, Any]:
+        merged = dict(base)
+        merged.update(queue.capabilities)
+        return merged
+
+    wanted = " ".join(str(item) for item in requirements)
     if requested:
         queue = protocol.queue_named(requested)
         if queue is None:
             raise FleetError(
                 f"protocol {protocol.name!r} does not define queue {requested!r}"
             )
+        mismatches = capability_mismatches(requirements, surface(queue))
+        if mismatches:
+            raise FleetError(
+                f"queue {queue.name!r} does not satisfy {wanted}: "
+                f"{'; '.join(mismatches)}"
+            )
         return queue
-    queue = protocol.default_queue()
-    if queue is None:
-        raise FleetError(
-            f"protocol {protocol.name!r} does not define a default queue"
+    candidates = [
+        queue
+        for queue in protocol.queues
+        if not capability_mismatches(requirements, surface(queue))
+    ]
+    if not candidates:
+        if not protocol.queues:
+            raise FleetError(
+                f"protocol {protocol.name!r} does not define a default queue"
+            )
+        detail = "\n".join(
+            f"  {queue.name}: "
+            f"{'; '.join(capability_mismatches(requirements, surface(queue)))}"
+            for queue in protocol.queues
         )
-    return queue
+        raise FleetError(
+            f"no queue on protocol {protocol.name!r} satisfies {wanted}:\n{detail}"
+        )
+    if fit:
+        return min(
+            candidates, key=lambda queue: (capability_cost(surface(queue)), queue.name)
+        )
+    for queue in candidates:
+        if queue.default:
+            return queue
+    return candidates[0]
 
 
 def slurm_gpu_directive(
@@ -3190,6 +3791,7 @@ def target_display(
         "default_profile": target.default_profile or "",
         "role": role,
         "pools": sorted(pool_names),
+        "capabilities": dict(target.capabilities),
     }
 
 
@@ -3202,7 +3804,6 @@ def protocol_display(protocol: ProtocolRecord) -> dict[str, Any]:
         "description": protocol.description or "",
         "default_profile": protocol.default_profile or "",
         "default_queue": default_queue.name if default_queue is not None else "",
-        "smoke_gpu_probe": protocol.smoke_gpu_probe,
         "gpu_request_mode": protocol.gpu_request_mode,
         "job_runtime": protocol.job_runtime,
         "native_batch_required": protocol.native_batch_required,
@@ -3231,6 +3832,7 @@ def queue_display(queue: QueueRecord) -> dict[str, Any]:
         "constraint": queue.constraint or "",
         "extra_directives": list(queue.extra_directives),
         "notes": list(queue.notes),
+        "capabilities": dict(queue.capabilities),
     }
 
 
@@ -3520,6 +4122,14 @@ tags = ["example"]
 secret_backend = "file"
 secret_ref = "~/.config/fleet/secrets/{name}.toml"
 default_profile = "plain-ssh"
+
+# What the machine has, for `--require` and `--fit`. Any key you like; these
+# four are compared as numbers. `gpu_count = 0` also silences the GPU probe.
+[capabilities]
+arch = "x86_64"
+gpu_count = 0
+cpus = 8
+mem_gb = 16
 """
 
 
@@ -3690,6 +4300,15 @@ def toml_key(key: str) -> str:
     return toml_string(key)
 
 
+def toml_scalar(value: Any) -> str:
+    """Serialize one scalar as TOML."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return toml_string(str(value))
+
+
 def secret_to_toml(secret: FleetSecret) -> str:
     """Serialize a secret file."""
     lines = [
@@ -3747,6 +4366,13 @@ def target_to_toml(target: TargetRecord) -> str:
         lines.append(f"ssh_host_alias = {toml_string(target.ssh_host_alias)}")
     if target.default_profile:
         lines.append(f"default_profile = {toml_string(target.default_profile)}")
+    if target.capabilities:
+        # Last, and it has to be: a table header ends the bare-key section, so
+        # anything emitted after this would be read as part of it.
+        lines.append("")
+        lines.append("[capabilities]")
+        for key, value in sorted(target.capabilities.items()):
+            lines.append(f"{toml_key(key)} = {toml_scalar(value)}")
     return "\n".join(lines) + "\n"
 
 
@@ -4001,11 +4627,64 @@ def reach_dependents(context: FleetContext) -> dict[str, list[str]]:
 
 def command_list(args: argparse.Namespace, context: FleetContext) -> int:
     """List configured targets."""
+    requirements = parse_requirements(getattr(args, "require", None) or ())
+    # Filtered on capability alone, deliberately including disabled targets: this
+    # is a report, not a selection, and "it would fit but it is switched off" is
+    # the single most useful thing it can tell you.
+    fits = (
+        {
+            target.name
+            for target in context.targets.values()
+            if context.capability_refusal(target, requirements) is None
+        }
+        if requirements
+        else None
+    )
+
+    def shown(target: TargetRecord) -> bool:
+        if args.tag and args.tag not in target.tags:
+            return False
+        return fits is None or target.name in fits
+
+    if args.format == "capabilities":
+        rows = []
+        for target in sorted(context.targets.values(), key=lambda item: item.name):
+            if not shown(target):
+                continue
+            for queue_name, capabilities in context.selectable_capabilities(target):
+                row = {
+                    "name": target.name,
+                    "queue": queue_name or "",
+                    "enabled": target.enabled,
+                }
+                row.update(
+                    {
+                        key: capability_text(value)
+                        for key, value in capabilities.items()
+                    }
+                )
+                rows.append(row)
+        declared = {key for row in rows for key in row} - {"name", "queue", "enabled"}
+        # FIT_ORDER first because that is the order `--fit` costs them in, then
+        # whatever else the fleet declares, alphabetically.
+        columns = [key for key in FIT_ORDER if key in declared] + sorted(
+            declared - set(FIT_ORDER)
+        )
+        for row in rows:
+            for key in columns:
+                row.setdefault(key, "")
+        emit_rows(
+            rows,
+            ["name", "queue", "enabled", *columns],
+            as_json=bool(args.json),
+        )
+        return 0
+
     if args.format == "ssh-hosts":
         for target in sorted(context.targets.values(), key=lambda item: item.name):
             if not target.enabled:
                 continue
-            if args.tag and args.tag not in target.tags:
+            if not shown(target):
                 continue
             print(f"fleet:{target.name}")
         return 0
@@ -4014,7 +4693,7 @@ def command_list(args: argparse.Namespace, context: FleetContext) -> int:
         carried = reach_dependents(context)
         rows = []
         for target in sorted(context.targets.values(), key=lambda item: item.name):
-            if args.tag and args.tag not in target.tags:
+            if not shown(target):
                 continue
             rows.append(
                 {
@@ -4039,7 +4718,7 @@ def command_list(args: argparse.Namespace, context: FleetContext) -> int:
 
     rows = []
     for target in sorted(context.targets.values(), key=lambda item: item.name):
-        if args.tag and args.tag not in target.tags:
+        if not shown(target):
             continue
         protocol = context.resolve_protocol(target)
         rows.append(
@@ -4161,7 +4840,12 @@ def command_queue_list(args: argparse.Namespace, context: FleetContext) -> int:
 
 def command_resolve(args: argparse.Namespace, context: FleetContext) -> int:
     """Resolve one pool or project binding to a concrete target name."""
-    target, _binding = context.resolve_target(args.selector, cwd=Path.cwd())
+    target, _binding = context.resolve_target(
+        args.selector,
+        cwd=Path.cwd(),
+        requirements=parse_requirements(getattr(args, "require", None) or ()),
+        fit=bool(getattr(args, "fit", False)),
+    )
     if args.json:
         emit({"target": target.name}, as_json=True)
     else:
@@ -4205,6 +4889,13 @@ def command_import_ssh(args: argparse.Namespace, context: FleetContext) -> int:
         secret_backend="file",
         secret_ref=str(secret_path),
         default_profile=args.profile or "plain-ssh",
+        capabilities=parse_capabilities(
+            dict(
+                parse_assignment(item, flag="--capability")
+                for item in args.capability
+            ),
+            what=f"--capability for target {name!r}",
+        ),
     )
     write_text_file(target_path, target_to_toml(target), mode=PRIVATE_FILE_MODE)
     write_text_file(secret_path, secret_to_toml(secret), mode=PRIVATE_FILE_MODE)
@@ -5031,7 +5722,7 @@ def command_smoke(args: argparse.Namespace, context: FleetContext) -> int:
             " queues=\"$(sinfo -h -o '%P' | paste -sd, -)\";"
             " if [ -n \"$queues\" ]; then printf 'queues=%s\\n' \"$queues\"; fi;"
         )
-    elif protocol.smoke_gpu_probe:
+    elif not declares_no_gpu(target):
         smoke_body += (
             " if command -v nvidia-smi >/dev/null 2>&1; then"
             " nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader;"
@@ -5356,7 +6047,13 @@ def command_submit(args: argparse.Namespace, context: FleetContext) -> int:
             "so the scheduler receives the site-native batch script unchanged"
         )
     ensure_job_id_pattern(profile)
-    queue = resolve_queue(protocol, args.queue)
+    queue = plan.queue
+    if queue is None:
+        raise FleetError(
+            f"internal error: no queue resolved for {target.name!r}. plan_queue() "
+            "and this branch disagree about which submit path this is; they are "
+            "meant to test the same three conditions in the same order."
+        )
     remote_script = (
         planned_script_path(profile, local_script)
         if args.dry_run
@@ -5628,15 +6325,35 @@ def command_explain(args: argparse.Namespace, context: FleetContext) -> int:
     use, so this is also the debugging story for "why did it pick that?".
     """
     selector = context.normalize_selector(args.selector)
-    target, binding = context.resolve_target(selector, cwd=Path.cwd())
+    requirements = parse_requirements(getattr(args, "require", None) or ())
+    fit = bool(getattr(args, "fit", False))
+    target, binding = context.resolve_target(
+        selector, cwd=Path.cwd(), requirements=requirements, fit=fit
+    )
     protocol = context.resolve_protocol(target)
+    profile = context.resolve_profile(target, binding, args.profile)
+    plan_verb = args.verb or "explain"
+    queue: QueueRecord | None = None
+    queue_problem: str | None = None
+    try:
+        queue = plan_queue(
+            args,
+            verb=plan_verb,
+            target=target,
+            protocol=protocol,
+            profile=profile,
+            requirements=requirements,
+            fit=fit,
+        )
+    except FleetError as error:
+        queue_problem = str(error)
     plan = Plan(
-        verb=args.verb or "explain",
+        verb=plan_verb,
         context=context,
         target=target,
         binding=binding,
         protocol=protocol,
-        profile=context.resolve_profile(target, binding, args.profile),
+        profile=profile,
         cwd=resolve_remote_root(target, binding, args.cwd),
         selector=selector,
         pool=context.pools.get(selector) if selector else None,
@@ -5646,6 +6363,8 @@ def command_explain(args: argparse.Namespace, context: FleetContext) -> int:
             getattr(args, "route", None),
             no_fallback=bool(getattr(args, "no_fallback", False)),
         ),
+        queue=queue,
+        requirements=requirements,
     )
     role = resolve_role(target, protocol)
     payload = plan.describe()
@@ -5657,7 +6376,14 @@ def command_explain(args: argparse.Namespace, context: FleetContext) -> int:
     payload["route_last_used"] = (
         last_used.get("route") if isinstance(last_used, dict) else None
     )
-    payload["queues"] = [queue.name for queue in protocol.queues]
+    payload["queues"] = [item.name for item in protocol.queues]
+    payload["queue_problem"] = queue_problem
+    # Every surface a requirement could match here, which is one per partition on
+    # a scheduler and exactly one otherwise.
+    payload["capabilities"] = [
+        {"queue": name, "capabilities": capabilities}
+        for name, capabilities in context.selectable_capabilities(target)
+    ]
     payload["admission"] = {
         verb: DECISION_LABELS[ROLE_MATRIX[role][VERBS.index(verb)]]
         for verb in (VERBS if args.verb is None else (args.verb,))
@@ -5782,6 +6508,18 @@ def command_doctor(args: argparse.Namespace) -> int:
                 warnings.append(
                     f"target {target.name!r} uses Slurm protocol {protocol.name!r} "
                     "without any queue presets"
+                )
+            warnings.extend(
+                capability_key_warnings(
+                    f"target {target.name!r}", target.capabilities
+                )
+            )
+            for queue in protocol.queues:
+                warnings.extend(
+                    capability_key_warnings(
+                        f"protocol {protocol.name!r} queue {queue.name!r}",
+                        queue.capabilities,
+                    )
                 )
 
         # A pool that cannot be selected from is a pool that aborts the first
@@ -6094,7 +6832,96 @@ DEPRECATED
     `[ssh_option]` ProxyJump entry.
 
 SEE ALSO
-    fleetctl help roles, fleetctl help secrets, fleetctl help config
+    fleetctl help roles, fleetctl help capabilities, fleetctl help config
+""",
+    "capabilities": """\
+NAME
+    fleetctl capabilities - what a machine has, and how to ask for it
+
+SYNOPSIS
+    # targets.d/<target>.toml
+    [capabilities]
+    arch      = "x86_64"
+    gpu_model = "RTX 3090"
+    gpu_count = 1
+    vram_gb   = 24
+    cpus      = 16
+    mem_gb    = 64
+
+    fleetctl list --format capabilities
+    fleetctl <verb> --require 'vram_gb>=24,gpu_count>=1' [--fit]
+
+DESCRIPTION
+    `role` is a boundary: it says what may be done at all. Capabilities
+    are the layer above it, and they only ever choose between hosts
+    that the boundary already allows. Keeping them apart is deliberate
+    -- attribute matching cannot express a boundary, and a boundary
+    cannot express "which of these will fit".
+
+    Any key you like. `{FIT_KEYS}` are compared as
+    numbers and must be non-negative; everything else is compared as
+    text. The vocabulary is open because a fleet grows in variety, and
+    this is the one place in the config where an unknown key is not an
+    error -- a misspelled capability fails closed, so
+    `--require vram_bg>=24` simply matches nothing and says so.
+    `fleetctl doctor` still names a key that looks like a typo.
+
+REQUIREMENTS
+    `--require key<op>value`, repeatable and comma-separated within one
+    flag. Operators: >= <= > < = == !=. Every clause carries one; there
+    is no bare-key form, because `--fit lab-gpu` would be ambiguous
+    with a target name.
+
+    An undeclared capability never satisfies a requirement. An unknown
+    is not a yes, and reading it as one is how a job lands on a machine
+    that cannot run it.
+
+    A requirement narrows a choice; it never moves work. Against a name
+    -- a target you passed, or one a project binding supplied -- it is
+    a check that refuses with the exact mismatch. Against a set -- a
+    pool, or the whole fleet when nothing else named anything -- it is
+    a filter. So a typo in a capability can stop a command, but it can
+    never redirect one.
+
+    `--fit` breaks a tie by taking the smallest sufficient candidate:
+    fewest {FIT_KEYS}, then by name. An
+    undeclared key sorts last, so `--fit` prefers a machine known to be
+    big enough over one that might be. Without `--fit`, an ambiguous
+    fleet-wide match is refused rather than resolved alphabetically.
+
+SCHEDULERS
+    On a Slurm site the hardware a job gets belongs to the partition,
+    not to the login node you SSH into. So a queue carries its own
+    block:
+
+        [[queue]]
+        name = "mi210"
+        partition = "GPU"
+          [queue.capabilities]
+          gpu_model = "MI210"
+          vram_gb = 64
+
+    A queue's capabilities layer over the target's, and the target
+    satisfies a requirement when any of its queues does. `--require`
+    then filters the partitions too, and `--fit` picks the smallest
+    sufficient one, so a one-GPU job stops booking the eight-GPU
+    partition.
+
+PREFLIGHT
+    `--gpus` is checked against declared `gpu_count` and
+    `--cpus-per-task` against `cpus` before anything connects. Nothing
+    declared is not a refusal here -- you named the machine, and
+    requiring a declaration first would make capabilities a migration
+    rather than a feature. `--mem` is deliberately not checked: its
+    units are scheduler-specific, and a wrong parse would refuse a
+    valid job.
+
+    Declared values are authoritative and nothing is measured. What a
+    machine has is a fact its owner writes down, not something probed
+    at selection time and already stale.
+
+SEE ALSO
+    fleetctl help roles, fleetctl help jobs, fleetctl help config
 """,
     "config": """\
 NAME
@@ -6142,7 +6969,7 @@ VALIDATION
     carrying a deprecated key, and never prints its value.
 
 SEE ALSO
-    fleetctl help secrets, fleetctl help reach, fleetctl help verbs
+    fleetctl help secrets, fleetctl help reach, fleetctl help capabilities
 """,
     "secrets": """\
 NAME
@@ -6284,8 +7111,14 @@ DESCRIPTION
         fleetctl doctor
         fleetctl doctor --probe
 
+    Pick a machine by what it has rather than by name, smallest
+    sufficient one first:
+        fleetctl list --format capabilities
+        fleetctl resolve --require 'vram_gb>=24,gpu_count>=1' --fit
+        fleetctl submit train.sh --require 'vram_gb>=40' --fit
+
 SEE ALSO
-    fleetctl help verbs, fleetctl help reach, fleetctl help jobs
+    fleetctl help verbs, fleetctl help capabilities, fleetctl help jobs
 """,
 }
 
@@ -6340,6 +7173,7 @@ def render_manual(topic: str) -> str:
         .replace("{ADMISSION_TABLE}", render_admission_table())
         .replace("{VERB_TABLE}", render_verb_table())
         .replace("{TOPIC_LIST}", "  ".join(MANUAL_TOPICS))
+        .replace("{FIT_KEYS}", ", ".join(FIT_ORDER))
         .rstrip()
     )
 
@@ -6364,6 +7198,32 @@ def add_route_flag(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_capability_flags(parser: argparse.ArgumentParser) -> None:
+    """Register `--require` and `--fit`, the soft layer above `role`.
+
+    Attached to every verb that opens a connection, plus `list`, `resolve` and
+    `explain`, so the question and the answer use the same words.
+    """
+    parser.add_argument(
+        "--require",
+        action="append",
+        metavar="KEY<OP>VALUE",
+        help=(
+            "Only accept a declared capability, e.g. `vram_gb>=24`. Repeatable, "
+            "and comma-separated within one flag. Absence never satisfies."
+        ),
+    )
+    parser.add_argument(
+        "--fit",
+        action="store_true",
+        help=(
+            "Take the smallest sufficient candidate: fewest "
+            + ", then ".join(FIT_ORDER)
+            + ", then by name"
+        ),
+    )
+
+
 def add_connection_flags(parser: argparse.ArgumentParser) -> None:
     """Register the flags every verb that opens a connection carries.
 
@@ -6377,6 +7237,7 @@ def add_connection_flags(parser: argparse.ArgumentParser) -> None:
         help="Acknowledge a control-plane action on a role that repels this verb",
     )
     add_route_flag(parser)
+    add_capability_flags(parser)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -6420,11 +7281,15 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--json", action="store_true", help="Emit JSON")
     list_parser.add_argument(
         "--format",
-        choices=["table", "ssh-hosts", "topology"],
+        choices=["table", "ssh-hosts", "topology", "capabilities"],
         default="table",
-        help="Output format; `topology` reports routes and what each bridge carries",
+        help=(
+            "Output format; `topology` reports routes and what each bridge "
+            "carries, `capabilities` one row per selectable surface"
+        ),
     )
     list_parser.add_argument("--tag", help="Filter by one target tag")
+    add_capability_flags(list_parser)
     list_parser.set_defaults(handler=command_list)
 
     show_parser = subparsers.add_parser("show", help="Show one target or pool")
@@ -6480,6 +7345,7 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_parser = subparsers.add_parser("resolve", help="Resolve a selector to a target")
     resolve_parser.add_argument("selector", nargs="?", help="Target or pool name")
     resolve_parser.add_argument("--json", action="store_true", help="Emit JSON")
+    add_capability_flags(resolve_parser)
     resolve_parser.set_defaults(handler=command_resolve)
 
     project_parser = subparsers.add_parser("project", help="Manage project bindings")
@@ -6628,6 +7494,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Tag to attach to the imported target",
+    )
+    import_ssh_parser.add_argument(
+        "--capability",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Declare one capability, e.g. `vram_gb=24`. Repeatable. "
+            + ", ".join(FIT_ORDER)
+            + " must be non-negative numbers; any other key is yours to name."
+        ),
     )
     import_ssh_parser.add_argument(
         "--profile",
@@ -6909,6 +7786,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show the plan as it would resolve with --admin",
     )
     add_route_flag(explain_parser)
+    add_capability_flags(explain_parser)
     explain_parser.add_argument("--json", action="store_true", help="Emit JSON")
     explain_parser.set_defaults(handler=command_explain)
 
