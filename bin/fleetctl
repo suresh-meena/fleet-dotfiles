@@ -93,6 +93,17 @@ DECISION_LABELS = {
     DENY: "refused",
 }
 
+# One line per admission verb, keyed on VERBS so `fleetctl help verbs` renders
+# from the vocabulary rather than from a list that can quietly fall behind it.
+VERB_SUMMARY = {
+    "ssh": "open an interactive session",
+    "exec": "run one command, your argv preserved",
+    "script": "stage a local script and run it there",
+    "sync": "push or pull a directory with rsync",
+    "submit": "hand a script to the site's scheduler",
+    "job": "status, logs and cancel for a submitted job",
+}
+
 # Why a verb is refused outright, so the error names the alternative instead of
 # just restating the rule.
 DENY_REASON = {
@@ -5492,6 +5503,471 @@ def command_doctor(args: argparse.Namespace) -> int:
         return 1
     return 0
 
+# ---- SECTION: manual -------------------------------------------------------
+#
+# The manual lives in the file for the same reason the policy does: fleetctl is
+# one file you copy to a new machine, and documentation that ships separately is
+# documentation that will not be there when you need it.  `fleetctl help` is the
+# whole thing; there is no man page to install and nothing to keep in sync.
+#
+# The two tables are rendered from ROLE_MATRIX and VERB_SUMMARY at print time,
+# so the manual cannot disagree with the policy it describes.
+
+MANUAL: dict[str, str] = {
+    "overview": """\
+NAME
+    fleetctl - drive your own machines under one admission policy
+
+SYNOPSIS
+    fleetctl [--config-home <dir>] [--state-home <dir>]
+             [--cache-home <dir>] <subcommand> [options] [-- <payload>]
+    fleetctl help [<topic>]
+
+DESCRIPTION
+    One file of Python 3 and the standard library, driving ssh, scp and
+    rsync against a private TOML inventory. It is a policy layer, not a
+    transport: most of its value is in what it refuses.
+
+    What may be done to a machine is decided by its `role` and by
+    nothing else, through one table read in one place. Nothing touches
+    a host without a resolved plan, and building that plan performs the
+    admission check, so a new verb cannot forget it.
+
+    The config loads once per run. The repair and diagnostic
+    subcommands opt out, because for those a broken config is the input
+    rather than a precondition.
+
+OPTIONS
+    --config-home, --state-home and --cache-home override the three
+    roots; see `fleetctl help config`. There are no short options.
+
+    Everything after the first bare `--` is a verbatim payload, split
+    off before the argument parser sees it, so it can never be read as
+    a fleetctl flag -- or swallow one.
+
+EXIT STATUS
+    0    success
+    1    `doctor` found problems
+    2    any refusal, and any usage error
+    130  interrupted
+
+    Any other status is the remote command's own: ssh, exec, script,
+    sync, submit and job return what ran there.
+
+TOPICS
+    {TOPIC_LIST}
+
+SEE ALSO
+    fleetctl help verbs, fleetctl help roles, fleetctl help reach
+""",
+    "verbs": """\
+NAME
+    fleetctl verbs - what each subcommand does, and what it refuses
+
+SYNOPSIS
+    fleetctl <verb> [<target>|<pool>] [--admin] [--route <route>]
+    fleetctl exec <target> [--tty] [--dry-run] -- <argv>...
+    fleetctl script <file> --target <target> [--interpreter <cmd>]
+    fleetctl sync push|pull <local> [<remote>] [--delete] [--force]
+    fleetctl submit <file> [--queue <preset>] [--native-batch]
+
+ADMISSION VERBS
+    Six subcommands are the columns of the role matrix:
+
+{VERB_TABLE}
+
+    `smoke` is not one of them: it only reports on the host, so it is
+    admitted as `ssh`. Nine subcommands open a connection and so carry
+    --admin and --route together -- ssh, smoke, exec, script, sync,
+    submit, and the three `job` operations. `explain` takes both too,
+    so you can ask what an --admin run or a chosen route would do
+    without doing it.
+
+EVERYTHING ELSE
+    Inventory   list, show, explain, resolve, protocol show,
+                queue list, project bind|show|list
+    Setup       init, import-ssh, migrate-config, migrate-env
+    Secrets     seed-pass, deploy-config
+    Diagnosis   doctor, help
+
+    --json is on the inspection and diagnostic subcommands only. A verb
+    that runs remote work prints what the remote printed.
+
+REFUSALS WORTH KNOWING
+    `exec` takes its command after `--` and nowhere else. Naming a
+    target both positionally and with --target is an error, and an
+    empty payload is an error rather than a login shell.
+
+    `sync --delete` refuses a home or root directory outright, and
+    refuses the target's own workdir, or any pull, without --force.
+
+    `--dry-run` prints the resolved plan and exits 0, claiming nothing
+    about remote state. `sync` is the exception that earns it: it runs
+    `rsync --dry-run --itemize-changes` and returns rsync's own code.
+
+SEE ALSO
+    fleetctl help roles, fleetctl help jobs, fleetctl help examples
+""",
+    "roles": """\
+NAME
+    fleetctl roles - what a machine is, and what that permits
+
+SYNOPSIS
+    role = "bridge"|"login"|"compute"|"workstation"|"storage"
+    fleetctl <verb> <target> [--admin]
+    fleetctl explain <target> [<verb>]
+
+DESCRIPTION
+    A role is a taint in the Kubernetes sense: it repels work rather
+    than attracting it, and --admin is a toleration -- permission,
+    never a recommendation.
+
+    bridge       an SSH waypoint. Its job is to be jumped through.
+    login        a submission surface. Compute goes through `submit`.
+    compute      a node you hold directly and may run work on.
+    workstation  a machine you own outright. No scheduler.
+    storage      a data mover. Not a place to run anything.
+
+    There is deliberately no role meaning "scheduler node where direct
+    execution is fine", so the state this tool exists to prevent cannot
+    be spelled in the config at all.
+
+ADMISSION
+    One table decides, and one function reads it:
+
+{ADMISSION_TABLE}
+
+    A refusal names the alternative rather than restating the rule --
+    "run compute through `fleetctl submit`" -- and no flag lifts it.
+    `fleetctl explain <target>` reports every cell for one host, where
+    a refusal is the answer rather than an error.
+
+INFERENCE
+    A target with no `role` gets the conservative reading of its
+    protocol: "login" when the protocol schedules, "workstation" when
+    it runs work directly. An unmigrated fleet is therefore never less
+    guarded than it was before roles existed, and `doctor` names every
+    target still relying on the guess.
+
+    Role and protocol must agree. `role = "login"` on a protocol that
+    runs work directly is refused at load time, and so is any other
+    role on a scheduler-backed one: either combination is a machine
+    whose safety rules and execution path disagree.
+
+SEE ALSO
+    fleetctl help verbs, fleetctl help reach, fleetctl help config
+""",
+    "reach": """\
+NAME
+    fleetctl reach - how a connection gets to a host
+
+SYNOPSIS
+    reach = ["direct"]
+    reach = ["direct", "via:<bridge>"]
+    fleetctl <verb> <target> --route direct|via:<bridge>
+
+DESCRIPTION
+    How a host is reached is inventory, not a credential. `reach` is an
+    ordered list of routes on the target: "direct" for a host you dial
+    yourself, "via:<target>" for one carried by another fleet target.
+    It defaults to ["direct"]. A repeated route is refused, and so is
+    an empty list, which would mean nothing could ever reach the host.
+
+    The order is the point. Direct comes first and is the route taken;
+    a `via:` entry behind it is the declared fallback, because the one
+    machine that multiplexes every clustered connection is the last
+    thing you want in the path when you do not need it. `--route`
+    selects a declared route and never invents one: a route fleetctl
+    was never told about is a guess about someone else's network, and
+    the failure it produces is a timeout rather than an error.
+
+    Carrying other connections is a declared job. Every `via:` must
+    name a real, enabled target whose role is "bridge"; self-bridges
+    and cycles are refused. The graph is checked once per load, so a
+    missing bridge is one fault rather than one per host behind it.
+
+    A hop is a full fleetctl connection to the bridge -- its own
+    secret, and the same private known_hosts, IdentitiesOnly, timeouts
+    and control socket the destination gets -- rendered as `ssh -W
+    %h:%p` in a ProxyCommand, and it chains. `-W` forwards a stream and
+    runs nothing, which is why using a bridge is transport rather than
+    execution and takes no admission check: `exec` on that same bridge
+    is still refused. A password-authenticated bridge is refused as a
+    hop, because sshpass hands one password to the whole process tree.
+
+LIMITS
+    Nothing falls back on its own yet: the first declared route is the
+    one used, and a `via:` entry is a fallback you select. Both routes
+    to one host also share a control socket, because OpenSSH's %C hash
+    does not cover the ProxyCommand -- so a warm direct connection goes
+    on serving a `--route via:` command until it expires.
+
+    `list --format topology` prints the graph: each target's routes,
+    and what each bridge carries.
+
+DEPRECATED
+    The secret key `proxy_jump` is accepted and ignored. Declare
+    `reach` instead; `migrate-config` lifts an old hop out for you. A
+    waypoint that is not itself a fleet target stays expressible as an
+    `[ssh_option]` ProxyJump entry.
+
+SEE ALSO
+    fleetctl help roles, fleetctl help secrets, fleetctl help config
+""",
+    "config": """\
+NAME
+    fleetctl config - the inventory, and why a typo is fatal
+
+SYNOPSIS
+    $FLEET_CONFIG_HOME  (default ~/.config/fleet)
+        config.toml  projects.toml
+        targets.d/  pools.d/  protocols.d/  profiles.d/  secrets/
+    $FLEET_STATE_HOME   known_hosts
+    $FLEET_CACHE_HOME   mux/  (ssh control sockets)
+
+DESCRIPTION
+    Those three variables, or the defaults above, decide every path;
+    --config-home, --state-home and --cache-home override them for one
+    run.
+
+    A target is a machine: `role`, `protocol`, `reach`, `workdir`,
+    `tags`, and a pointer to its secret. A pool is an ordered set,
+    named either by `targets` or by `match_tags`, and selection takes
+    its first enabled member. A protocol describes a site: whether
+    compute is scheduled there, and the queue presets. A profile
+    describes how work runs: `submit_command`, `status_command`,
+    `cancel_command`, `logs_command`, `job_id_pattern` and `[script]`.
+    A project binding maps a local directory onto a target and a
+    remote root, so a bound directory needs no --target.
+
+    A record's name is its `name` key or the file stem, and two files
+    claiming one name is an error rather than a silent last-one-wins.
+    `protocol` is mandatory: guessing it once turned a scheduler site
+    into a box you could run training on. `direct` and `slurm` are
+    built in, and protocols.d overrides them. For profiles, --profile
+    beats the project binding, which beats the target, which beats the
+    protocol.
+
+VALIDATION
+    An unknown key is fatal, and the error names the file, the key and
+    a likely correction -- because the default that fills in for a
+    misspelling is always the permissive one. A `version` other than 1
+    is refused. Every role, protocol and profile disagreement is
+    reported in one pass rather than one per run.
+
+    `[defaults]` has no valid keys left: `redact_sensitive_output` is
+    accepted and ignored. `fleetctl doctor` names every file still
+    carrying a deprecated key, and never prints its value.
+
+SEE ALSO
+    fleetctl help secrets, fleetctl help reach, fleetctl help verbs
+""",
+    "secrets": """\
+NAME
+    fleetctl secrets - connection material, kept out of the inventory
+
+SYNOPSIS
+    secret_backend = "file" | "pass" | "inline"
+    secret_ref = "<config-home>/secrets/<target>.toml"
+    fleetctl show <target> --secret [--sensitive]
+
+DESCRIPTION
+    A secret record carries only what should stay out of version
+    control: `host`, `user`, `port`, `auth`, `identity_file`,
+    `password`, `identities_only`, `forward_agent`, `compression`,
+    `connect_timeout`, `server_alive_interval`,
+    `server_alive_count_max`, `strict_host_key_checking`, `batch_mode`
+    and an `[ssh_option]` table. `host` and `user` are required; `port`
+    defaults to 22, `auth` to "key", `identities_only` to true, and the
+    connect and keepalive timeouts to 30 seconds. Each `[ssh_option]`
+    entry becomes one `-o key=value`, which is the escape hatch for
+    everything fleetctl does not model.
+
+    Three backends: a private TOML file, a `pass` entry, or a
+    `secret = { ... }` table inline in the target. Resolution is lazy,
+    on first use, so only the code that opens a connection pays for it.
+
+    A `host`, `user`, `port`, `password` or `identity_file` key in a
+    target file is refused with that explanation, not a spelling hint:
+    it belongs in the secret.
+
+WHAT IS PRINTED
+    `show --secret` redacts host and user together and reports the
+    port, the auth mode, whether an identity is configured and whether
+    a password is on file. A username beside a redacted host is half a
+    credential. `--sensitive` asks for the real values, one command at
+    a time, rather than a setting that changes what everything prints.
+
+    Files are written 0600 and directories 0700, and `doctor` treats a
+    group- or world-readable secret as a problem rather than a warning.
+    `seed-pass` copies live config into `pass`; `deploy-config` renders
+    a fresh tree beside the live one, validates it, and only then swaps
+    -- keeping one previous generation, and never clearing `secrets/`
+    unless it can refill it.
+
+    auth = "password" runs ssh under sshpass with pubkey auth off, and
+    is refused on a bridge. BatchMode is never forced, so a
+    passphrase-protected key or a 2FA prompt can still be answered when
+    there is a terminal to answer on.
+
+SEE ALSO
+    fleetctl help config, fleetctl help reach
+""",
+    "jobs": """\
+NAME
+    fleetctl jobs - submitting compute, and following it
+
+SYNOPSIS
+    fleetctl submit <file> [--target <target>] [--queue <preset>]
+        [--job-name <name>] [--time <limit>] [--gpus <n>]
+        [--cpus-per-task <n>] [--mem <size>] [--output <path>]
+        [--error <path>] [--native-batch] [--dry-run] [-- <args>]
+    fleetctl job status|logs|cancel <job_id> [--target <target>]
+
+DESCRIPTION
+    `submit` has two paths, and the profile decides which: a profile
+    submits if and only if it defines `submit_command`. Without one the
+    script is staged and run directly over SSH, and resource flags are
+    refused, because nothing there could honour them. With one, the
+    staged script is wrapped in a small scheduler preamble built from
+    the queue preset and your overrides. --native-batch sends your file
+    unchanged instead, refusing script arguments and resource flags
+    alike; a protocol can require it.
+
+    Resources come from a named queue preset on the protocol. Without
+    --queue the protocol's default is used; a missing default or an
+    unknown name is an error rather than a guess. A GPU request renders
+    as --gpus or --gres according to the protocol's `gpu_request_mode`.
+
+    Nothing is submitted until a job id could be reported back: a
+    submitting profile with no `job_id_pattern` is refused up front.
+    After the scheduler has accepted the script nothing may raise -- a
+    traceback there would orphan a real allocation -- so the output is
+    echoed, and an id that cannot be parsed becomes a warning telling
+    you to confirm before you resubmit.
+
+JOB CONTROL
+    `job status`, `job logs` and `job cancel` run the profile's own
+    `status_command`, `logs_command` and `cancel_command` with the job
+    id substituted, and return the remote exit code. A profile that
+    defines none refuses the operation rather than doing nothing
+    quietly. Job output defaults to `%j.out` and `%j.err` under the
+    protocol's `job_output_dir`, and the printed log paths have `%j`
+    already replaced.
+
+SEE ALSO
+    fleetctl help verbs, fleetctl help config, fleetctl help examples
+""",
+    "examples": """\
+NAME
+    fleetctl examples - worked invocations
+
+DESCRIPTION
+    <target> is a target name, <bridge> a target whose role is
+    "bridge", <project> a local directory, <alias> an entry in your own
+    SSH config, <preset> a queue name from the protocol.
+
+    Import an existing SSH alias, naming what the machine is:
+        fleetctl import-ssh <alias> --name <target> --role workstation
+
+    Declare a fallback route, then pin one connection to it:
+        # targets.d/<target>.toml
+        reach = ["direct", "via:<bridge>"]
+        fleetctl exec <target> --route via:<bridge> -- uptime
+
+    See the fleet as a graph, with what each bridge carries:
+        fleetctl list --format topology
+
+    Ask what a selector resolves to, and what it admits, without
+    running anything:
+        fleetctl explain <target>
+        fleetctl explain <target> submit --json
+
+    Bind a directory once, so later commands need no target:
+        cd <project> && fleetctl project bind --target <target>
+        fleetctl sync push .
+        fleetctl exec -- python3 --version
+
+    Run a local script with arguments; after `--` is verbatim:
+        fleetctl script ./setup.sh --target <target> -- --flag value
+
+    Submit to a named queue, then follow the job:
+        fleetctl submit train.sh --target <target> --queue <preset>
+        fleetctl job status <job_id> --target <target>
+
+    Touch a login node's control plane on purpose:
+        fleetctl exec <target> --admin -- squeue --me
+
+    Check the local setup, then the one remote prerequisite:
+        fleetctl doctor
+        fleetctl doctor --probe
+
+SEE ALSO
+    fleetctl help verbs, fleetctl help reach, fleetctl help jobs
+""",
+}
+
+MANUAL_TOPICS = tuple(MANUAL)
+
+
+def render_admission_table() -> str:
+    """Render ROLE_MATRIX as a grid, so the manual cannot contradict the policy."""
+    glyphs = {ALLOW: "yes", ADMIN: "admin", DENY: "no"}
+    widths = [max(len(verb), 5) + 1 for verb in VERBS]
+    role_column = max(len(role) for role in ROLES) + 2
+    rows = [
+        "    "
+        + "role".ljust(role_column)
+        + "".join(verb.ljust(width) for verb, width in zip(VERBS, widths))
+    ]
+    for role in ROLES:
+        rows.append(
+            "    "
+            + role.ljust(role_column)
+            + "".join(
+                glyphs[decision].ljust(width)
+                for decision, width in zip(ROLE_MATRIX[role], widths)
+            )
+        )
+    rows.append("")
+    rows.append("    yes = allowed    admin = needs --admin    no = refused")
+    return "\n".join(row.rstrip() for row in rows)
+
+
+def render_verb_table() -> str:
+    """Render one line per admission verb, keyed on the closed vocabulary.
+
+    A verb added to VERBS without a summary shows up as undocumented rather than
+    silently vanishing from the manual.
+    """
+    column = max(len(verb) for verb in VERBS) + 4
+    return "\n".join(
+        "    " + verb.ljust(column) + VERB_SUMMARY.get(verb, "(undocumented)")
+        for verb in VERBS
+    )
+
+
+def render_manual(topic: str) -> str:
+    """Return one manual topic with its generated tables substituted."""
+    if topic not in MANUAL:
+        raise FleetError(
+            f"no manual topic {topic!r}; try one of: {', '.join(MANUAL_TOPICS)}"
+        )
+    return (
+        MANUAL[topic]
+        .replace("{ADMISSION_TABLE}", render_admission_table())
+        .replace("{VERB_TABLE}", render_verb_table())
+        .replace("{TOPIC_LIST}", "  ".join(MANUAL_TOPICS))
+        .rstrip()
+    )
+
+
+def command_help(args: argparse.Namespace) -> int:
+    """Print one manual topic."""
+    print(render_manual(args.topic or "overview"))
+    return 0
+
+
 def add_route_flag(parser: argparse.ArgumentParser) -> None:
     """Register `--route`, which pins one of a target's declared routes."""
     parser.add_argument(
@@ -5518,12 +5994,32 @@ def add_connection_flags(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser."""
-    parser = argparse.ArgumentParser(prog="fleetctl")
+    parser = argparse.ArgumentParser(
+        prog="fleetctl",
+        epilog=(
+            "`fleetctl help` prints the manual; `fleetctl help <topic>` one "
+            "section of it. Topics: " + "  ".join(MANUAL_TOPICS) + "."
+        ),
+    )
     parser.add_argument("--config-home", type=Path, help="Override FLEET_CONFIG_HOME")
     parser.add_argument("--state-home", type=Path, help="Override FLEET_STATE_HOME")
     parser.add_argument("--cache-home", type=Path, help="Override FLEET_CACHE_HOME")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    help_parser = subparsers.add_parser(
+        "help",
+        help="Show the manual: overview, or one topic",
+    )
+    help_parser.add_argument(
+        "topic",
+        nargs="?",
+        choices=MANUAL_TOPICS,
+        help="Manual topic; omit for the overview",
+    )
+    # Loads no config on purpose: the manual has to be readable on a machine
+    # where nothing is set up yet, which is exactly when it is wanted.
+    help_parser.set_defaults(handler=command_help, loads_own_config=True)
 
     init_parser = subparsers.add_parser("init", help="Initialize local fleet directories")
     init_parser.add_argument(
